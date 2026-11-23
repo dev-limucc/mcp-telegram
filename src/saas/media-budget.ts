@@ -1,5 +1,6 @@
 import { lstatSync, readdirSync, statfsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { maxDownloadBytes } from "../file-policy.js";
 
 const MIB = 1048576;
 interface Options {
@@ -14,6 +15,14 @@ interface Options {
 }
 type Usage = { bytes: number; files: number };
 
+function envBytes(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid ${name}`);
+  return value;
+}
+
 /** One gateway owns admission; reservations remain held until physical worker settlement. */
 export class SaasMediaBudget {
   private readonly root: string;
@@ -27,8 +36,17 @@ export class SaasMediaBudget {
   constructor(private options: Options) {
     this.root = resolve(options.root);
     this.maxFileBytes = options.maxFileBytes ?? 20 * MIB;
-    this.maxUserBytes = options.maxUserBytes ?? 100 * MIB;
-    this.maxTotalBytes = options.maxTotalBytes ?? 500 * MIB;
+    // A download reserves the whole download limit while it runs, so the defaults leave room
+    // for one full-size download per account and three at once (2000 MiB each by default).
+    // MCP_TELEGRAM_MEDIA_USER_BYTES / MCP_TELEGRAM_MEDIA_TOTAL_BYTES override them; the free
+    // disk reserve below still applies to every reservation.
+    const download = maxDownloadBytes();
+    this.maxUserBytes =
+      options.maxUserBytes ?? envBytes("MCP_TELEGRAM_MEDIA_USER_BYTES") ?? Math.max(100 * MIB, download + 100 * MIB);
+    this.maxTotalBytes =
+      options.maxTotalBytes ??
+      envBytes("MCP_TELEGRAM_MEDIA_TOTAL_BYTES") ??
+      Math.max(500 * MIB, 3 * download + 200 * MIB);
     this.maxUserFiles = options.maxUserFiles ?? 100;
     this.maxTotalFiles = options.maxTotalFiles ?? 1000;
     this.minFreeBytes = options.minFreeBytes ?? 256 * MIB;

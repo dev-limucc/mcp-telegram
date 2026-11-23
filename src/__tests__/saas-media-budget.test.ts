@@ -80,3 +80,26 @@ test("uploads reserve both payload and metadata entries atomically", async () =>
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("default budgets leave room for one full-size download per account and follow the env", async () => {
+  const root = await mkdtemp(join(tmpdir(), "media-budget-"));
+  const user = "11111111-1111-4111-8111-111111111111";
+  const saved = { ...process.env };
+  const MiB = 1048576;
+  try {
+    await mkdir(join(root, user));
+    process.env.MCP_TELEGRAM_MAX_DOWNLOAD_BYTES = String(100 * MiB);
+    const budget = new SaasMediaBudget({ root, minFreeBytes: 1, availableBytes: () => 10_000 * MiB });
+    const release = budget.reserve(user, { bytes: 100 * MiB + 1024, files: 3 });
+    assert.throws(() => budget.reserve(user, { bytes: 150 * MiB, files: 1 }), /quota/);
+    release();
+    process.env.MCP_TELEGRAM_MEDIA_USER_BYTES = String(50 * MiB);
+    const strict = new SaasMediaBudget({ root, minFreeBytes: 1, availableBytes: () => 10_000 * MiB });
+    assert.throws(() => strict.reserve(user, { bytes: 60 * MiB, files: 1 }), /quota/);
+  } finally {
+    for (const key of ["MCP_TELEGRAM_MAX_DOWNLOAD_BYTES", "MCP_TELEGRAM_MEDIA_USER_BYTES"])
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    await rm(root, { recursive: true, force: true });
+  }
+});

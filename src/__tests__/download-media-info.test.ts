@@ -25,7 +25,16 @@ test("Telegram download metadata preserves the document name and the legacy path
     connected: true,
     client: {
       getMessages: async () => [{ media: new Api.MessageMediaDocument({ document }) }],
-      downloadMedia: async () => bytes,
+      // Downloads stream with upload.GetFile (512 KiB requests), not GramJS downloadMedia.
+      getSender: async (dcId: number) => ({ dcId }),
+      invokeWithSender: async (req: Api.upload.GetFile) => {
+        const offset = Number(req.offset.toString());
+        return new Api.upload.File({
+          type: new Api.storage.FileUnknown(),
+          mtime: 0,
+          bytes: bytes.subarray(offset, offset + req.limit),
+        });
+      },
     },
   });
   try {

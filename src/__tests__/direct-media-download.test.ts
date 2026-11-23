@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import express from "express";
-import { DirectMediaDownloads } from "../http/direct-media-download.js";
+import { DirectMediaDownloads, parseRange } from "../http/direct-media-download.js";
 import type { GatewayIdentity } from "../http/identity.js";
 import { createMcpHandler } from "../http/mcp-handler.js";
 import { ToolPolicy } from "../tool-policy.js";
@@ -15,7 +15,15 @@ import { ToolPolicy } from "../tool-policy.js";
 const owner = "11111111-1111-4111-8111-111111111111";
 const selected = "22222222-2222-4222-8222-222222222222";
 const foreign = "33333333-3333-4333-8333-333333333333";
-async function setup(bytes = Buffer.from("original Telegram file")) {
+type SetupOptions = {
+  maxBytes?: number;
+  waitMs?: number;
+  /** Write the first part, then wait for this before writing the rest (a slow Telegram download). */
+  hold?: Promise<void>;
+  /** Fail the worker call after writing the first part. */
+  fail?: Promise<void>;
+};
+async function setup(bytes = Buffer.from("original Telegram file"), options: SetupOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), "browser-download-"));
   let active = true,
     grant = true,
@@ -34,11 +42,27 @@ async function setup(bytes = Buffer.from("original Telegram file")) {
       assert.equal(name, "telegram-download-media");
       if (args.chatId !== "42") throw new Error("Chat not allowed");
       calls.push({ accountId, args });
-      await writeFile(args.downloadPath as string, bytes, { flag: "wx", mode: 0o600 });
+      if (options.hold || options.fail) {
+        const half = Math.floor(bytes.length / 2);
+        await writeFile(args.downloadPath as string, bytes.subarray(0, half), { flag: "wx", mode: 0o600 });
+        if (options.fail) {
+          await options.fail;
+          throw new Error("FILE_REFERENCE_EXPIRED");
+        }
+        await options.hold;
+        await writeFile(args.downloadPath as string, bytes.subarray(half), { flag: "a" });
+      } else await writeFile(args.downloadPath as string, bytes, { flag: "wx", mode: 0o600 });
       return { content: [], structuredContent: { fileName: "отчёт.pdf", sizeBytes: bytes.length } };
     },
   } as unknown as GatewayIdentity;
-  const downloads = new DirectMediaDownloads({ root, origin: "https://mcp.test", identity, now: () => now });
+  const downloads = new DirectMediaDownloads({
+    root,
+    origin: "https://mcp.test",
+    identity,
+    now: () => now,
+    maxBytes: options.maxBytes,
+    waitMs: options.waitMs,
+  });
   await downloads.initialize();
   const app = express();
   downloads.mount(app);
@@ -54,6 +78,9 @@ async function setup(bytes = Buffer.from("original Telegram file")) {
     base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     expire: () => {
       now += 300001;
+    },
+    advance: (ms: number) => {
+      now += ms;
     },
     revoke: () => {
       grant = false;
@@ -231,7 +258,7 @@ test("real MCP HTTP download calls return a clickable link without requiring a V
 });
 
 test("oversized media and replaced file paths cannot become download capabilities", async () => {
-  const s = await setup(Buffer.alloc(20 * 1048576 + 1));
+  const s = await setup(Buffer.alloc(20 * 1048576 + 1), { maxBytes: 20 * 1048576 });
   try {
     await assert.rejects(s.downloads.create(owner, "grant", input), /size|limit/i);
     assert.deepEqual(await readdir(join(s.root, owner, ".mcp-downloads")), []);
@@ -257,4 +284,105 @@ test("expired orphan cleanup is limited to marked temporary downloads", async ()
   } finally {
     await s.close();
   }
+});
+
+const until = async (check: () => Promise<boolean>) => {
+  for (let i = 0; i < 200 && !(await check()); i++) await new Promise((r) => setTimeout(r, 10));
+};
+
+test("large files answer preparing, report progress on the same link, then serve the exact bytes", async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const s = await setup(Buffer.alloc(2 * 1048576 + 17, 7), { waitMs: 30, hold });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.equal(ticket.status, "preparing");
+    assert.match(ticket.downloadUrl, /#token=/);
+    const progress = await fetch(s.url(ticket), { headers: s.headers(ticket) });
+    assert.equal(progress.status, 202);
+    assert.equal(progress.headers.get("retry-after"), "3");
+    assert.equal((await progress.json()).receivedBytes, Math.floor(s.bytes.length / 2));
+    assert.equal((await fetch(s.url(ticket))).status, 401, "progress still needs the capability");
+    release();
+    await until(
+      async () => (await fetch(s.url(ticket), { method: "HEAD", headers: s.headers(ticket) })).status === 200,
+    );
+    const response = await fetch(s.url(ticket), { headers: s.headers(ticket) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), s.bytes);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a background download that fails says why and leaves no partial file", async () => {
+  let fail!: () => void;
+  const failure = new Promise<void>((r) => {
+    fail = r;
+  });
+  const s = await setup(Buffer.alloc(4096, 1), { waitMs: 20, fail: failure });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.equal(ticket.status, "preparing");
+    fail();
+    await until(async () => (await fetch(s.url(ticket), { headers: s.headers(ticket) })).status === 502);
+    const response = await fetch(s.url(ticket), { headers: s.headers(ticket) });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /FILE_REFERENCE_EXPIRED/);
+    const id = new URL(ticket.downloadUrl).pathname.split("/").pop() as string;
+    assert.equal((await readdir(join(s.root, owner, ".mcp-downloads", id))).includes("data"), false);
+    s.expire();
+    await s.downloads.prune();
+    assert.deepEqual(await readdir(join(s.root, owner, ".mcp-downloads")), []);
+  } finally {
+    await s.close();
+  }
+});
+
+test("range requests resume and seek inside the file; bad ranges are refused", async () => {
+  const bytes = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 251));
+  const s = await setup(bytes);
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    const head = await fetch(s.url(ticket), { method: "HEAD", headers: s.headers(ticket) });
+    assert.equal(head.headers.get("accept-ranges"), "bytes");
+    const part = await fetch(s.url(ticket), { headers: { ...s.headers(ticket), Range: "bytes=100-199" } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get("content-range"), "bytes 100-199/1000");
+    assert.deepEqual(Buffer.from(await part.arrayBuffer()), bytes.subarray(100, 200));
+    const tail = await fetch(s.url(ticket), { headers: { ...s.headers(ticket), Range: "bytes=-10" } });
+    assert.deepEqual(Buffer.from(await tail.arrayBuffer()), bytes.subarray(990));
+    const bad = await fetch(s.url(ticket), { headers: { ...s.headers(ticket), Range: "bytes=5000-" } });
+    assert.equal(bad.status, 416);
+    assert.equal(bad.headers.get("content-range"), "bytes */1000");
+  } finally {
+    await s.close();
+  }
+});
+
+test("each use keeps a link alive five more minutes; an unused link still expires", async () => {
+  const s = await setup();
+  try {
+    const used = await s.downloads.create(owner, "grant", input);
+    const idle = await s.downloads.create(owner, "grant", input);
+    s.advance(240000);
+    assert.equal((await fetch(s.url(used), { headers: s.headers(used) })).status, 200);
+    s.advance(240000);
+    assert.equal((await fetch(s.url(used), { headers: s.headers(used) })).status, 200, "renewed by the last use");
+    assert.equal((await fetch(s.url(idle), { headers: s.headers(idle) })).status, 410);
+  } finally {
+    await s.close();
+  }
+});
+
+test("parseRange accepts one byte range and rejects the rest", () => {
+  assert.equal(parseRange(undefined, 10), undefined);
+  assert.deepEqual(parseRange("bytes=2-5", 10), { start: 2, end: 5 });
+  assert.deepEqual(parseRange("bytes=7-", 10), { start: 7, end: 9 });
+  assert.deepEqual(parseRange("bytes=-3", 10), { start: 7, end: 9 });
+  assert.deepEqual(parseRange("bytes=8-100", 10), { start: 8, end: 9 });
+  for (const bad of ["bytes=10-", "bytes=5-2", "bytes=-0", "bytes=-", "bytes=0-1,4-5", "items=0-1"])
+    assert.equal(parseRange(bad, 10), "invalid", bad);
 });
