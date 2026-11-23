@@ -38,19 +38,18 @@ if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) {
     const quoted = /filename="((?:[^"\\]|\\.)*)"/i.exec(disposition)?.[1];
     const plain = quoted?.replace(/\\(.)/g, '$1');
     const filename = encoded ? decodeURIComponent(encoded) : plain || 'telegram-file.bin';
-    // Read in pieces to show progress on large files (up to 2000 MiB).
+    // Count bytes as they pass to show progress on large files (up to 2000 MiB); Response.blob()
+    // lets the browser keep the file in its own blob storage instead of page memory.
     const total = Number(response.headers.get('content-length')) || 0;
-    const reader = response.body.getReader();
-    const parts = [];
     let loaded = 0;
-    for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      parts.push(value);
-      loaded += value.length;
-      if (total) status.textContent = 'Скачивается: ' + mb(loaded) + ' из ' + mb(total);
-    }
-    const blob = new Blob(parts);
+    const counted = response.body.pipeThrough(new TransformStream({
+      transform(chunk, stream) {
+        loaded += chunk.length;
+        if (total) status.textContent = 'Скачивается: ' + mb(loaded) + ' из ' + mb(total);
+        stream.enqueue(chunk);
+      },
+    }));
+    const blob = await new Response(counted).blob();
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url; link.download = filename; link.className = 'button';

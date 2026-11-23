@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DOWNLOAD_MEDIA_TOOL, downloadTimeoutMs, maxDownloadBytes } from "../file-policy.js";
+import { DOWNLOAD_MEDIA_TOOL, DOWNLOAD_STEP_MAX_BYTES, maxDownloadBytes } from "../file-policy.js";
 import { GlobalLock } from "../global-lock.js";
 import { MEDIA_CHUNK_BYTES } from "../media-upload.js";
 import { SaasMediaBudget } from "./media-budget.js";
@@ -16,6 +16,8 @@ const WORKER_FEATURE_ENV = [
   "MCP_TELEGRAM_ENABLE_PRIVATE_CALLS",
   "MCP_TELEGRAM_CALL_MEDIA_HOSTS",
   "MCP_TELEGRAM_CALL_PYTHON",
+  // Workers enforce the download size limit themselves, so they must see the same value.
+  "MCP_TELEGRAM_MAX_DOWNLOAD_BYTES",
 ] as const;
 export function workerFeatureEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   const out: Record<string, string> = {};
@@ -535,10 +537,14 @@ export class WorkerSupervisor {
   call(userId: string, name: string, args: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
     const mediaWrites: Array<{ bytes?: number; files?: number }> = [];
     const remote = { bytes: 20 * 1048576 + 1024, files: 3 }; // payload, metadata and atomic metadata replacement
-    // A download streams up to the configured limit to disk: reserve that much (payload,
-    // metadata and its atomic replacement) and give it the long download deadline.
-    const download = name === DOWNLOAD_MEDIA_TOOL;
-    if (download) mediaWrites.push({ bytes: maxDownloadBytes() + 1024, files: 3 });
+    // A download streams to disk: one step (offsetBytes) writes at most DOWNLOAD_STEP_MAX_BYTES
+    // and a single-call download at most the download limit. Reserve that (payload, metadata
+    // and its atomic replacement); bytes already on disk count through the storage scan.
+    if (name === DOWNLOAD_MEDIA_TOOL)
+      mediaWrites.push({
+        bytes: (typeof args.offsetBytes === "number" ? DOWNLOAD_STEP_MAX_BYTES : maxDownloadBytes()) + 1024,
+        files: 3,
+      });
     if (name === "telegram-upload-media")
       mediaWrites.push(args.fileId ? { bytes: MEDIA_CHUNK_BYTES + 1024, files: 1 } : remote);
     const sourceTools = new Set([
@@ -563,7 +569,6 @@ export class WorkerSupervisor {
     if (albumDownloads) mediaWrites.push({ bytes: 20 * 1048576 + albumDownloads * 1024, files: albumDownloads * 3 });
     return this.request(userId, (generation, id) => ({ kind: "tool", generation, id, name, args }), {
       ...options,
-      ...(download ? { timeoutMs: downloadTimeoutMs() + 5000 } : {}),
       mediaWrites,
       queue: true,
       tool: name,

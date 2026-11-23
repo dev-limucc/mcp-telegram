@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,13 +22,25 @@ type SetupOptions = {
   hold?: Promise<void>;
   /** Fail the worker call after writing the first part. */
   fail?: Promise<void>;
+  /** Bytes one download step writes (default: the whole file in one step). */
+  stepBytes?: number;
+  /** Fail this many steps after the first one (a worker restart or a dropped request). */
+  flaky?: number;
+  /** Answer every step with this worker error text. */
+  refuse?: string;
+  /** Called before each step with its offset. */
+  onStep?: (offset: number) => void;
+  /** Refuse this many calls as a busy supervisor would, before the worker sees them. */
+  busy?: number;
 };
 async function setup(bytes = Buffer.from("original Telegram file"), options: SetupOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), "browser-download-"));
   let active = true,
     grant = true,
     profile = "full",
-    now = 1000;
+    now = 1000,
+    flaky = options.flaky ?? 0,
+    busy = options.busy ?? 0;
   const calls: Array<{ accountId: string; args: Record<string, unknown> }> = [];
   const identity = {
     kind: "saas",
@@ -38,21 +50,54 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
       if (id && ![owner, selected].includes(id)) throw new Error("Foreign account");
       return new ToolPolicy({ profile, chatIds: ["42"] });
     },
+    // A worker that downloads in steps (offsetBytes), like telegram-download-media does.
     callTool: async (accountId: string, name: string, args: Record<string, unknown>) => {
       assert.equal(name, "telegram-download-media");
       if (args.chatId !== "42") throw new Error("Chat not allowed");
       calls.push({ accountId, args });
-      if (options.hold || options.fail) {
-        const half = Math.floor(bytes.length / 2);
-        await writeFile(args.downloadPath as string, bytes.subarray(0, half), { flag: "wx", mode: 0o600 });
-        if (options.fail) {
-          await options.fail;
-          throw new Error("FILE_REFERENCE_EXPIRED");
+      const path = args.downloadPath as string,
+        offset = args.offsetBytes as number;
+      assert.equal(typeof offset, "number", "the link service downloads in steps");
+      options.onStep?.(offset);
+      if (busy > 0) {
+        busy--;
+        throw new Error("Telegram worker busy: queue deadline exceeded");
+      }
+      if (options.refuse) return { content: [{ type: "text", text: options.refuse }], isError: true };
+      // Like the real tool, the worker answers its own failures with isError, never by throwing.
+      try {
+        if (offset === 0) await writeFile(path, Buffer.alloc(0), { flag: "wx", mode: 0o600 });
+        else assert.equal((await stat(path)).size, offset, "each step continues the partial file");
+        let end = Math.min(bytes.length, offset + (options.stepBytes ?? bytes.length));
+        if (options.hold || options.fail) {
+          // The first step brings half the file; the next one waits for the test.
+          if (offset === 0) end = Math.floor(bytes.length / 2);
+          else if (options.fail) {
+            await options.fail;
+            throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+          } else {
+            await options.hold;
+            end = bytes.length;
+          }
         }
-        await options.hold;
-        await writeFile(args.downloadPath as string, bytes.subarray(half), { flag: "a" });
-      } else await writeFile(args.downloadPath as string, bytes, { flag: "wx", mode: 0o600 });
-      return { content: [], structuredContent: { fileName: "отчёт.pdf", sizeBytes: bytes.length } };
+        if (offset > 0 && flaky > 0) {
+          flaky--;
+          await appendFile(path, bytes.subarray(offset, offset + 1));
+          throw new Error("connection reset");
+        }
+        await appendFile(path, bytes.subarray(offset, end));
+        return {
+          content: [],
+          structuredContent: {
+            fileName: "отчёт.pdf",
+            sizeBytes: end,
+            totalBytes: bytes.length,
+            done: end >= bytes.length,
+          },
+        };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+      }
     },
   } as unknown as GatewayIdentity;
   const downloads = new DirectMediaDownloads({
@@ -62,6 +107,7 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
     now: () => now,
     maxBytes: options.maxBytes,
     waitMs: options.waitMs,
+    retryDelayMs: 1,
   });
   await downloads.initialize();
   const app = express();
@@ -330,7 +376,10 @@ test("a background download that fails says why and leaves no partial file", asy
     await until(async () => (await fetch(s.url(ticket), { headers: s.headers(ticket) })).status === 502);
     const response = await fetch(s.url(ticket), { headers: s.headers(ticket) });
     assert.equal(response.status, 502);
-    assert.match((await response.json()).error, /FILE_REFERENCE_EXPIRED/);
+    const { error } = await response.json();
+    assert.equal(error, "Telegram media could not be downloaded");
+    assert.doesNotMatch(error, /ENOENT|browser-download-|\.mcp-downloads/, "no server paths in the answer");
+    assert.equal(s.calls.length, 2 + 3, "a step after progress is retried three times");
     const id = new URL(ticket.downloadUrl).pathname.split("/").pop() as string;
     assert.equal((await readdir(join(s.root, owner, ".mcp-downloads", id))).includes("data"), false);
     s.expire();
@@ -357,6 +406,9 @@ test("range requests resume and seek inside the file; bad ranges are refused", a
     const bad = await fetch(s.url(ticket), { headers: { ...s.headers(ticket), Range: "bytes=5000-" } });
     assert.equal(bad.status, 416);
     assert.equal(bad.headers.get("content-range"), "bytes */1000");
+    const several = await fetch(s.url(ticket), { headers: { ...s.headers(ticket), Range: "bytes=0-1,5-6" } });
+    assert.equal(several.status, 200, "an unsupported Range header is ignored, not refused");
+    assert.deepEqual(Buffer.from(await several.arrayBuffer()), bytes);
   } finally {
     await s.close();
   }
@@ -377,12 +429,98 @@ test("each use keeps a link alive five more minutes; an unused link still expire
   }
 });
 
-test("parseRange accepts one byte range and rejects the rest", () => {
+test("parseRange serves one byte range, refuses unsatisfiable ones and ignores the rest (RFC 9110)", () => {
   assert.equal(parseRange(undefined, 10), undefined);
   assert.deepEqual(parseRange("bytes=2-5", 10), { start: 2, end: 5 });
   assert.deepEqual(parseRange("bytes=7-", 10), { start: 7, end: 9 });
   assert.deepEqual(parseRange("bytes=-3", 10), { start: 7, end: 9 });
+  assert.deepEqual(parseRange("bytes=-30", 10), { start: 0, end: 9 });
   assert.deepEqual(parseRange("bytes=8-100", 10), { start: 8, end: 9 });
-  for (const bad of ["bytes=10-", "bytes=5-2", "bytes=-0", "bytes=-", "bytes=0-1,4-5", "items=0-1"])
-    assert.equal(parseRange(bad, 10), "invalid", bad);
+  for (const unsatisfiable of ["bytes=10-", "bytes=10-20", "bytes=-0"])
+    assert.equal(parseRange(unsatisfiable, 10), "invalid", unsatisfiable);
+  for (const ignored of ["bytes=5-2", "bytes=-", "bytes=0-1,4-5", "items=0-1", "bytes=a-"])
+    assert.equal(parseRange(ignored, 10), undefined, ignored);
+});
+
+test("downloads run in short worker steps and a failed step resumes from the partial file", async () => {
+  const bytes = Buffer.from(Array.from({ length: 4500 }, (_, i) => i % 249));
+  const s = await setup(bytes, { stepBytes: 1000, flaky: 1 });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.equal(ticket.status, "ready");
+    assert.equal(ticket.sizeBytes, bytes.length);
+    // The step at 1000 failed after writing one byte; the retry continued from the file's real size.
+    assert.deepEqual(
+      s.calls.map((c) => c.args.offsetBytes),
+      [0, 1000, 1001, 2001, 3001, 4001],
+    );
+    const response = await fetch(s.url(ticket), { headers: s.headers(ticket) });
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+  } finally {
+    await s.close();
+  }
+});
+
+test("revoking access stops a download between steps", async () => {
+  let s!: Awaited<ReturnType<typeof setup>>;
+  s = await setup(Buffer.alloc(5000, 3), { stepBytes: 1000, onStep: (offset) => offset === 1000 && s.revoke() });
+  try {
+    await assert.rejects(s.downloads.create(owner, "grant", input), /revoked/);
+    assert.equal(s.calls.length, 2, "no step runs after the grant is revoked");
+    assert.deepEqual(await readdir(join(s.root, owner, ".mcp-downloads")), []);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a refused first step is not retried and says the file is over the limit", async () => {
+  const s = await setup(undefined, { refuse: "Error: Media size exceeds configured download limit" });
+  try {
+    await assert.rejects(s.downloads.create(owner, "grant", input), /larger than the 2000 MiB download limit/);
+    assert.equal(s.calls.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a call that is already cancelled starts no download", async () => {
+  const s = await setup();
+  try {
+    await assert.rejects(s.downloads.create(owner, "grant", input, { signal: AbortSignal.abort() }), /cancelled/);
+    assert.equal(s.calls.length, 0);
+    assert.deepEqual(await readdir(join(s.root, owner, ".mcp-downloads")), []);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a busy worker is waited for, but a first step never continues a file it did not create", async () => {
+  const s = await setup(undefined, { busy: 2 });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.deepEqual(
+      s.calls.map((c) => c.args.offsetBytes),
+      [0, 0, 0],
+    );
+    assert.deepEqual(
+      Buffer.from(await (await fetch(s.url(ticket), { headers: s.headers(ticket) })).arrayBuffer()),
+      s.bytes,
+    );
+    const taken = await setup(undefined, { busy: 1 });
+    try {
+      const path = join(taken.root, owner, "mine.pdf");
+      await mkdir(join(taken.root, owner), { recursive: true });
+      await writeFile(path, "the caller's own file");
+      await assert.rejects(taken.downloads.create(owner, "grant", { ...input, downloadPath: path }));
+      assert.equal(await readFile(path, "utf8"), "the caller's own file", "an existing legacy file is left alone");
+      assert.deepEqual(
+        taken.calls.map((c) => c.args.offsetBytes),
+        [0, 0],
+      );
+    } finally {
+      await taken.close();
+    }
+  } finally {
+    await s.close();
+  }
 });

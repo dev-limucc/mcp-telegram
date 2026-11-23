@@ -36,17 +36,19 @@ export class SaasMediaBudget {
   constructor(private options: Options) {
     this.root = resolve(options.root);
     this.maxFileBytes = options.maxFileBytes ?? 20 * MIB;
-    // A download reserves the whole download limit while it runs, so the defaults leave room
-    // for one full-size download per account and three at once (2000 MiB each by default).
-    // MCP_TELEGRAM_MEDIA_USER_BYTES / MCP_TELEGRAM_MEDIA_TOTAL_BYTES override them; the free
-    // disk reserve below still applies to every reservation.
+    // A finished download stays on disk until its link expires, so the defaults let an account
+    // hold one full-size file while it fetches the next (2000 MiB each by default), and four
+    // such files at once across accounts. MCP_TELEGRAM_MEDIA_USER_BYTES and
+    // MCP_TELEGRAM_MEDIA_TOTAL_BYTES override them; the free disk reserve below still applies.
     const download = maxDownloadBytes();
     this.maxUserBytes =
-      options.maxUserBytes ?? envBytes("MCP_TELEGRAM_MEDIA_USER_BYTES") ?? Math.max(100 * MIB, download + 100 * MIB);
+      options.maxUserBytes ??
+      envBytes("MCP_TELEGRAM_MEDIA_USER_BYTES") ??
+      Math.max(100 * MIB, 2 * download + 100 * MIB);
     this.maxTotalBytes =
       options.maxTotalBytes ??
       envBytes("MCP_TELEGRAM_MEDIA_TOTAL_BYTES") ??
-      Math.max(500 * MIB, 3 * download + 200 * MIB);
+      Math.max(500 * MIB, 4 * download + 200 * MIB);
     this.maxUserFiles = options.maxUserFiles ?? 100;
     this.maxTotalFiles = options.maxTotalFiles ?? 1000;
     this.minFreeBytes = options.minFreeBytes ?? 256 * MIB;

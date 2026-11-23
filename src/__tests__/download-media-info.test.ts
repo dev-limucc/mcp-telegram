@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -47,6 +47,76 @@ test("Telegram download metadata preserves the document name and the legacy path
     assert.deepEqual(await readFile(legacy), bytes);
     await assert.rejects(service.downloadMediaWithInfo("@me", 7, legacy), /EEXIST/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stepped downloads hold the account for about two seconds per call and continue the partial file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-download-step-"));
+  const bytes = Buffer.from(Array.from({ length: 5 * 524288 }, (_, i) => i % 253));
+  const document = new Api.Document({
+    id: bigInt(1),
+    accessHash: bigInt(2),
+    fileReference: Buffer.alloc(0),
+    date: 1,
+    mimeType: "video/mp4",
+    size: bigInt(bytes.length),
+    dcId: 1,
+    attributes: [new Api.DocumentAttributeFilename({ fileName: "lecture.mp4" })],
+  });
+  const realNow = Date.now;
+  let clock = 1_000_000,
+    lookups = 0,
+    failNext = false;
+  // Each 512 KiB request "takes" 1.5 s, so a step reads two of them and stops.
+  Date.now = () => clock;
+  const service = new TelegramService(1, "fixture");
+  Object.assign(service, {
+    connected: true,
+    client: {
+      getMessages: async () => {
+        lookups++;
+        return [{ media: new Api.MessageMediaDocument({ document }) }];
+      },
+      getSender: async (dcId: number) => ({ dcId }),
+      invokeWithSender: async (req: Api.upload.GetFile) => {
+        clock += 1500;
+        if (failNext) {
+          failNext = false;
+          throw new Error("connection reset");
+        }
+        const offset = Number(req.offset.toString());
+        return new Api.upload.File({
+          type: new Api.storage.FileUnknown(),
+          mtime: 0,
+          bytes: bytes.subarray(offset, offset + req.limit),
+        });
+      },
+    },
+  });
+  try {
+    const path = join(root, "lecture.mp4");
+    const first = await service.downloadMediaStep("@me", 7, path, 0);
+    assert.deepEqual(first, { fileName: "lecture.mp4", sizeBytes: 1048576, totalBytes: bytes.length, done: false });
+    await assert.rejects(service.downloadMediaStep("@me", 7, path, 5), /does not match offsetBytes/);
+    failNext = true;
+    await assert.rejects(service.downloadMediaStep("@me", 7, path, first.sizeBytes), /connection reset/);
+    assert.equal((await stat(path)).size, first.sizeBytes, "a failed later step keeps the partial file");
+    const second = await service.downloadMediaStep("@me", 7, path, first.sizeBytes);
+    assert.equal(second.sizeBytes, 2097152);
+    const last = await service.downloadMediaStep("@me", 7, path, second.sizeBytes);
+    assert.deepEqual(last, { fileName: "lecture.mp4", sizeBytes: bytes.length, totalBytes: bytes.length, done: true });
+    assert.deepEqual(await readFile(path), bytes);
+    assert.equal(lookups, 1, "continuing steps reuse the located file instead of calling getMessages");
+    const fresh = join(root, "fresh.mp4");
+    failNext = true;
+    await assert.rejects(service.downloadMediaStep("@me", 7, fresh, 0), /connection reset/);
+    await assert.rejects(stat(fresh), { code: "ENOENT" }, "a failed first step leaves no file");
+    await writeFile(join(root, "taken.mp4"), "mine");
+    await assert.rejects(service.downloadMediaStep("@me", 7, join(root, "taken.mp4"), 0), /EEXIST/);
+    assert.equal(await readFile(join(root, "taken.mp4"), "utf8"), "mine", "an existing file is never overwritten");
+  } finally {
+    Date.now = realNow;
     await rm(root, { recursive: true, force: true });
   }
 });

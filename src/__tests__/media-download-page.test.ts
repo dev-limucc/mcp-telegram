@@ -28,7 +28,15 @@ for (const [name, preparing] of [
       },
       replaceWith: (value: unknown) => assert.equal(value, anchor),
     };
-    const status = { textContent: "" };
+    const shown: string[] = [];
+    const status = {
+      set textContent(text: string) {
+        shown.push(text);
+      },
+      get textContent() {
+        return shown.at(-1) ?? "";
+      },
+    };
     let polls = 0;
     const bytes = Buffer.from("file bytes"),
       token = "a".repeat(43);
@@ -54,7 +62,8 @@ for (const [name, preparing] of [
       URLSearchParams,
       URL: urls,
       AbortSignal,
-      Blob,
+      Response,
+      TransformStream,
       setTimeout: (resolve: () => void) => resolve(),
       window: { addEventListener: () => {} },
       fetch: async (path: string, options: { headers: { Authorization: string }; cache: string }) => {
@@ -67,6 +76,7 @@ for (const [name, preparing] of [
         }
         return new Response(bytes, {
           headers: {
+            "Content-Length": String(bytes.length),
             "Content-Disposition": name.includes('"')
               ? "attachment; filename=" + JSON.stringify(name)
               : `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
@@ -81,6 +91,10 @@ for (const [name, preparing] of [
     assert.equal(saved, 1);
     assert.equal(anchor.href, "blob:test");
     assert.match(status.textContent, /Файл готов/);
+    assert.ok(
+      shown.some((text) => /Скачивается: 0\.0 МБ из 0\.0 МБ/.test(text)),
+      "progress is counted while the bytes stream",
+    );
     if (preparing) assert.equal(polls, 3, "polled while preparing, then downloaded");
   });
 

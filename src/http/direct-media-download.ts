@@ -15,6 +15,7 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { Express, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
@@ -26,13 +27,33 @@ import type { GatewayIdentity } from "./identity.js";
 import { DOWNLOAD_SCRIPT, DOWNLOAD_SCRIPT_PATH, downloadPage } from "./media-download-page.js";
 
 export const DOWNLOAD_TOOL = "telegram-download-media";
-/** Default size limit: Telegram's own (MCP_TELEGRAM_MAX_DOWNLOAD_BYTES overrides it). */
-export const DOWNLOAD_MAX_BYTES = 2000 * 1048576;
 const TTL = 5 * 60000;
 /** A tool call waits this long for the file; larger files then come back as "preparing". */
 const WAIT_MS = 40000;
 /** One transfer to a browser or program may run this long (2 GB at about 300 KB/s). */
 const TRANSFER_MAX_MS = 2 * 3600000;
+/** A running transfer re-checks the link's grant and policy this often. */
+const RECHECK_MS = 2000;
+/** A download step that fails after progress is retried this many times from the partial file. */
+const STEP_RETRIES = 3;
+/** Supervisor refusals that pass: a busy, restarting or timed-out worker. Others are final. */
+const TRANSIENT =
+  /^(Telegram worker (busy|deadline exceeded|capacity reached|unavailable|is stopping)|Worker unavailable|Telegram executor unavailable|Tool call timed out|Tool queue is full)/;
+/** A failure whose message is safe to show to the user (no server paths or internals). */
+class PublicDownloadError extends Error {}
+/** Fixed messages (from the supervisor or this service) that are safe to show as they are. */
+const PUBLIC_MESSAGES = new Set([
+  "Media storage quota reached",
+  "Media storage disk reserve reached",
+  "Downloads unavailable or access revoked",
+  "Invalid legacy output path",
+  "Download path is outside account storage",
+  "Unsafe account storage",
+  "Unsafe download storage",
+  "Invalid download size",
+  "Telegram media download made no progress",
+]);
+type StepResult = { fileName?: unknown; sizeBytes?: unknown; totalBytes?: unknown; done?: unknown };
 const PREFIX = "/media/downloads/";
 const UUID = /^[a-f0-9-]{36}$/;
 export const downloadSchema = z.object({
@@ -77,6 +98,8 @@ type Ticket = {
   preparing: boolean;
   /** Why a background download failed (kept until the link expires). */
   error?: string;
+  /** This download created the file at path (a legacy path may hold a caller's own file). */
+  created?: boolean;
 };
 interface Options {
   root: string;
@@ -88,8 +111,10 @@ interface Options {
   maxBytes?: number;
   /** How long the tool call waits before answering "preparing" (default 40 s). */
   waitMs?: number;
-  /** How long one download from Telegram may run (default: MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS or 15 min). */
+  /** How long one download from Telegram may run (default: MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS or 60 min). */
   timeoutMs?: number;
+  /** Pause before retrying a failed download step (default 1 s, doubled per retry). */
+  retryDelayMs?: number;
 }
 type Created = {
   downloadUrl: string;
@@ -116,6 +141,7 @@ export class DirectMediaDownloads {
   private readonly maxBytes: number;
   private readonly waitMs: number;
   private readonly timeoutMs: number;
+  private readonly retryDelayMs: number;
   /** Downloads that outlived their tool call, so close() can wait for them. */
   private background = new Set<Promise<unknown>>();
   constructor(private options: Options) {
@@ -125,6 +151,7 @@ export class DirectMediaDownloads {
     this.maxBytes = options.maxBytes ?? maxDownloadBytes();
     this.waitMs = options.waitMs ?? WAIT_MS;
     this.timeoutMs = options.timeoutMs ?? downloadTimeoutMs();
+    this.retryDelayMs = options.retryDelayMs ?? 1000;
   }
   initialize(): Promise<void> {
     if (!this.initialized)
@@ -200,7 +227,8 @@ export class DirectMediaDownloads {
     this.controllers.add(controller);
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs)]);
     const cancel = () => controller.abort(options?.signal?.reason);
-    options?.signal?.addEventListener("abort", cancel, { once: true });
+    if (options?.signal?.aborted) cancel();
+    else options?.signal?.addEventListener("abort", cancel, { once: true });
     const link = `${this.options.origin}${PREFIX}${id}#token=${token}`;
     const work = this.fetchFile(t, args, selected, signal).finally(() => this.controllers.delete(controller));
     let waitTimer: NodeJS.Timeout | undefined;
@@ -221,7 +249,7 @@ export class DirectMediaDownloads {
         };
     } catch (e) {
       await this.retire(t);
-      throw e;
+      throw new Error(this.failure(e));
     } finally {
       clearTimeout(waitTimer);
       options?.signal?.removeEventListener("abort", cancel);
@@ -230,7 +258,7 @@ export class DirectMediaDownloads {
     t.preparing = true;
     const finishing = work
       .catch(async (e) => {
-        t.error = e instanceof Error ? e.message : String(e);
+        t.error = this.failure(e);
         await t.handle?.close().catch(() => {});
         t.handle = undefined;
         if (t.dir) await rm(join(t.dir, "data"), { force: true });
@@ -252,7 +280,6 @@ export class DirectMediaDownloads {
   }
   /** Fetch the file through the account's worker into private storage and arm the ticket. */
   private async fetchFile(t: Ticket, args: z.infer<typeof downloadSchema>, selected: string, signal: AbortSignal) {
-    const { owner } = t;
     const accountRoot = join(this.root, selected);
     await mkdir(accountRoot, { recursive: true, mode: 0o700 });
     if ((await lstat(accountRoot)).isSymbolicLink()) throw new Error("Unsafe account storage");
@@ -273,14 +300,14 @@ export class DirectMediaDownloads {
       t.path = join(t.dir, "data");
       await this.marker(t);
     }
-    signal.throwIfAborted();
-    const result = (await this.options.identity.callTool(
-      owner,
-      DOWNLOAD_TOOL,
-      { chatId: args.chatId, messageId: args.messageId, telegramAccountId: selected, downloadPath: t.path },
-      { signal },
-    )) as { isError?: boolean; structuredContent?: { fileName?: string } };
-    if (result.isError) throw new Error("Telegram media could not be downloaded");
+    let workerFileName: string | undefined;
+    try {
+      workerFileName = await this.fetchSteps(t, args, selected, signal);
+    } catch (e) {
+      // A legacy path is kept by design, but never a partial file this download created.
+      if (t.legacyPath && t.created) await rm(t.path, { force: true });
+      throw e;
+    }
     signal.throwIfAborted();
     await this.allowed(t);
     await new FilePolicy({ root: accountRoot, maxBytes: this.maxBytes }).upload(t.path);
@@ -289,9 +316,7 @@ export class DirectMediaDownloads {
     if (!info.isFile() || info.size < 1 || info.size > this.maxBytes) throw new Error("Invalid download size");
     t.sizeBytes = info.size;
     const suggested =
-      args.fileName ??
-      result.structuredContent?.fileName ??
-      (t.legacyPath ? basename(t.legacyPath) : `telegram-${args.messageId}.bin`);
+      args.fileName ?? workerFileName ?? (t.legacyPath ? basename(t.legacyPath) : `telegram-${args.messageId}.bin`);
     try {
       t.fileName = validateMediaName(suggested);
     } catch {
@@ -302,6 +327,91 @@ export class DirectMediaDownloads {
     signal.throwIfAborted();
     await this.allowed(t);
     t.ready = true;
+  }
+  /**
+   * Fetch the file in short steps (offsetBytes), each of which holds the account's worker for
+   * about two seconds, so the account's other tool calls get their turn while a large file
+   * downloads. A step that fails after progress is retried from the partial file's size.
+   */
+  private async fetchSteps(
+    t: Ticket,
+    args: z.infer<typeof downloadSchema>,
+    selected: string,
+    signal: AbortSignal,
+  ): Promise<string | undefined> {
+    const tooLarge = () =>
+      new PublicDownloadError(`The file is larger than the ${Math.floor(this.maxBytes / 1048576)} MiB download limit`);
+    let offset = 0,
+      failures = 0,
+      fileName: string | undefined;
+    for (;;) {
+      signal.throwIfAborted();
+      // Access is re-checked between steps, so revoking it stops a background download too.
+      await this.allowed(t);
+      let result: { isError?: boolean; content?: Array<{ text?: unknown }>; structuredContent?: StepResult };
+      let refused = false;
+      try {
+        result = (await this.options.identity.callTool(
+          t.owner,
+          DOWNLOAD_TOOL,
+          {
+            chatId: args.chatId,
+            messageId: args.messageId,
+            telegramAccountId: selected,
+            downloadPath: t.path,
+            offsetBytes: offset,
+          },
+          { signal },
+        )) as typeof result;
+        if (result.isError) {
+          if (String(result.content?.[0]?.text ?? "").includes("exceeds configured download limit")) throw tooLarge();
+          refused = true;
+          throw new Error("Telegram media could not be downloaded");
+        }
+      } catch (e) {
+        signal.throwIfAborted();
+        // Retried a few times: a busy, restarting or timed-out worker, and a later step the worker
+        // failed (its partial file is intact). Final: the worker refusing the first step (no
+        // media, no access, the file exists) and any other refusal (policy, scope, arguments).
+        const retry = refused ? offset > 0 : TRANSIENT.test(e instanceof Error ? e.message : "");
+        if (e instanceof PublicDownloadError || !retry || ++failures > STEP_RETRIES) throw e;
+        await sleep(this.retryDelayMs * 2 ** (failures - 1), undefined, { signal }).catch(() =>
+          signal.throwIfAborted(),
+        );
+        // A later step continues from what reached the disk. The first step always restarts at
+        // 0, which only creates a new file: a legacy path's existing file is never continued.
+        if (offset) offset = await this.received(t);
+        continue;
+      }
+      if (!offset) t.created = true;
+      const step = result.structuredContent ?? {};
+      const { sizeBytes, totalBytes } = step;
+      if (
+        typeof sizeBytes !== "number" ||
+        typeof totalBytes !== "number" ||
+        !Number.isSafeInteger(sizeBytes) ||
+        !Number.isSafeInteger(totalBytes) ||
+        sizeBytes < offset ||
+        sizeBytes > totalBytes
+      )
+        throw new Error("Invalid download size");
+      if (totalBytes > this.maxBytes) throw tooLarge();
+      if (step.done !== true && sizeBytes === offset) throw new Error("Telegram media download made no progress");
+      failures = 0;
+      offset = sizeBytes;
+      if (typeof step.fileName === "string") fileName = step.fileName;
+      if (step.done === true) return fileName;
+    }
+  }
+  /** A failure message that is safe to show: never a server path or an internal error. */
+  private failure(e: unknown): string {
+    const name = (e as { name?: unknown } | null)?.name;
+    if (name === "TimeoutError")
+      return `Telegram media could not be downloaded within ${Math.round(this.timeoutMs / 60000)} minutes`;
+    if (name === "AbortError") return "Telegram media download was cancelled";
+    if (e instanceof PublicDownloadError) return e.message;
+    const message = e instanceof Error ? e.message : "";
+    return PUBLIC_MESSAGES.has(message) ? message : "Telegram media could not be downloaded";
   }
   /** Bytes already on disk for a download that is still running (0 when unknown). */
   private async received(t: Ticket): Promise<number> {
@@ -430,7 +540,7 @@ export class DirectMediaDownloads {
           return;
         }
         if (t.error || !t.ready) {
-          res.status(502).json({ error: `Telegram media could not be downloaded: ${t.error ?? "unavailable"}` });
+          res.status(502).json({ error: t.error ?? "Telegram media could not be downloaded" });
           return;
         }
         const range = parseRange(req.headers.range, t.sizeBytes);
@@ -483,10 +593,15 @@ export class DirectMediaDownloads {
       const source = t.handle?.createReadStream({ autoClose: false, start, end });
       if (!source) throw new Error("Download unavailable");
       const self = this;
+      let checkedAt = Date.now();
       async function* checked() {
         for await (const chunk of source as NonNullable<typeof source>) {
           controller.signal.throwIfAborted();
-          await self.allowed(t);
+          // Revocation stops a running transfer within RECHECK_MS without a grant lookup per chunk.
+          if (Date.now() - checkedAt >= RECHECK_MS) {
+            await self.allowed(t);
+            checkedAt = Date.now();
+          }
           yield chunk;
         }
       }
@@ -518,24 +633,28 @@ export class DirectMediaDownloads {
   }
 }
 
-/** One "bytes=a-b", "bytes=a-" or "bytes=-n" range; undefined = whole file. */
+/**
+ * One "bytes=a-b", "bytes=a-" or "bytes=-n" range (RFC 9110 14.2). undefined = send the whole
+ * file, which is also the answer to a header this server does not handle (several ranges,
+ * another unit, bad syntax); "invalid" = a range the file cannot satisfy (416).
+ */
 export function parseRange(
   header: string | undefined,
   size: number,
 ): { start: number; end: number } | undefined | "invalid" {
   if (!header) return undefined;
   const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
-  if (!m || (!m[1] && !m[2])) return "invalid";
-  let start: number, end: number;
+  if (!m || (!m[1] && !m[2])) return undefined;
   if (!m[1]) {
     const suffix = Number(m[2]);
-    if (!Number.isSafeInteger(suffix) || suffix < 1) return "invalid";
-    start = Math.max(0, size - suffix);
-    end = size - 1;
-  } else {
-    start = Number(m[1]);
-    end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
+    if (!Number.isSafeInteger(suffix)) return undefined;
+    if (suffix < 1 || size < 1) return "invalid";
+    return { start: Math.max(0, size - suffix), end: size - 1 };
   }
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= size) return "invalid";
-  return { start, end };
+  const start = Number(m[1]),
+    last = m[2] ? Number(m[2]) : undefined;
+  if (!Number.isSafeInteger(start) || (last !== undefined && (!Number.isSafeInteger(last) || last < start)))
+    return undefined;
+  if (start >= size) return "invalid";
+  return { start, end: Math.min(last ?? size - 1, size - 1) };
 }

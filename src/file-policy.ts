@@ -20,16 +20,26 @@ export function maxDownloadBytes(env: NodeJS.ProcessEnv = process.env): number {
 export const DOWNLOAD_MEDIA_TOOL = "telegram-download-media";
 
 /**
- * How long one media download may run (MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS, default 15 min,
- * 30 s – 2 h). Only the download tool gets this; every other tool keeps its short deadline.
+ * How long one whole media download may take (MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS, default
+ * 60 min, 30 s – 6 h). The browser-link service downloads in short steps (see
+ * DOWNLOAD_STEP_MS) and applies this to the sum of them; an owner's single-call download
+ * gets it as its tool deadline. Every other tool keeps its short deadline.
  */
 export function downloadTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS;
-  const value = raw ? Number(raw) : 15 * 60000;
-  if (!Number.isSafeInteger(value) || value < 30000 || value > 2 * 3600000)
+  const value = raw ? Number(raw) : 60 * 60000;
+  if (!Number.isSafeInteger(value) || value < 30000 || value > 6 * 3600000)
     throw new Error("Invalid MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS");
   return value;
 }
+
+/**
+ * One download step (a call with offsetBytes) stops reading after this long, so the
+ * account's other tool calls, which queue for at most 5 s, get their turn between steps.
+ */
+export const DOWNLOAD_STEP_MS = 2000;
+/** One download step writes at most this much (the supervisor reserves it per step). */
+export const DOWNLOAD_STEP_MAX_BYTES = 64 * MIB;
 
 export class FilePolicy {
   private readonly root?: string;
@@ -78,6 +88,24 @@ export class FilePolicy {
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
       0o600,
     );
+    return { handle, path: target };
+  }
+  /**
+   * Reopen a partial download to continue it: the confined file must already exist, be a
+   * regular file (never a symlink) and hold exactly `size` bytes, so two writers or a
+   * stale offset can never splice a file together.
+   */
+  async openPartial(path: string, size: number): Promise<{ handle: FileHandle; path: string }> {
+    const target = await this.confined(path, true);
+    const handle = await open(target, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size !== size)
+        throw new Error("Partial download does not match offsetBytes; start the download again");
+    } catch (e) {
+      await handle.close();
+      throw e;
+    }
     return { handle, path: target };
   }
   async save(path: string, data: Buffer): Promise<void> {

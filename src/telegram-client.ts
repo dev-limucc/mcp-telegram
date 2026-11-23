@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync } from "node:fs";
-import { chmod, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, type FileHandle, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,7 @@ import { getInputUser, getPeerId } from "telegram/Utils.js";
 import { boundedMap } from "./bounded-map.js";
 import { type CallStatus, PrivateCallManager } from "./calls/private-call.js";
 import { SingleFlight } from "./connection-lifecycle.js";
-import { mediaPolicy } from "./file-policy.js";
+import { DOWNLOAD_STEP_MAX_BYTES, DOWNLOAD_STEP_MS, type FilePolicy, mediaPolicy } from "./file-policy.js";
 import {
   describeMessageMedia,
   isKnownUndownloadable,
@@ -222,6 +222,10 @@ const DEFAULT_SESSION_FILE = join(DEFAULT_SESSION_DIR, "session");
 const SESSION_STRING_RE = /^[A-Za-z0-9+/=]+$/;
 const MIN_SESSION_LENGTH = 100;
 const NOT_CONNECTED_ERROR = "Not connected. Run telegram-status to check or telegram-login to authenticate.";
+/** Largest chunk MediaReader.stream yields (one upload.GetFile request). */
+const MEDIA_CHUNK_BYTES = 512 * 1024;
+/** A located file is reused by the next download step for this long after its last use. */
+const RECENT_MEDIA_TTL_MS = 2 * 60000;
 
 /**
  * Telegram's invite-bearing requests (`messages.createChat`, `messages.addChatUser`,
@@ -395,6 +399,8 @@ export class TelegramService {
   private qrLogin: Promise<{ success: boolean; message: string }> | undefined;
   private qrAbort: AbortController | undefined;
   private client: TelegramClient | null = null;
+  /** The file the last download step read, so the next step can skip the message lookup. */
+  private recentMedia?: { key: string; source: MediaSource; fileName: string; usedAt: number };
   private apiId: number;
   private apiHash: string;
   private sessionString = "";
@@ -1389,23 +1395,13 @@ export class TelegramService {
     downloadPath: string,
     signal: AbortSignal | undefined = operationSignal(),
   ): Promise<{ fileName: string; sizeBytes: number }> {
-    if (!this.client || !this.connected) throw new Error(NOT_CONNECTED_ERROR);
-    const message = await this.loadMediaMessage(chatId, messageId);
-    if (isKnownUndownloadable(message.media)) throw notDownloadable(message.media);
-    const client = this.client;
-    const reader = new MediaReader(client, describeMessageMedia(message.media), () =>
-      this.loadMediaSource(chatId, messageId),
-    );
+    const { reader, fileName } = await this.locateMedia(chatId, messageId, false);
     const policy = mediaPolicy();
     policy.checkDownloadSize(reader.info.size);
     const output = await policy.openOutput(downloadPath);
     let written = 0;
     try {
-      for await (const chunk of reader.stream(0, signal)) {
-        written += chunk.length;
-        policy.checkDownloadSize(written);
-        await writeAll((buf, offset, length) => output.handle.write(buf, offset, length), chunk);
-      }
+      written = await this.writeMedia(reader, output.handle, 0, policy, signal);
       if (!written) throw new Error("Failed to download media");
     } catch (e) {
       await output.handle.close().catch(() => {});
@@ -1413,14 +1409,122 @@ export class TelegramService {
       throw e;
     }
     await output.handle.close();
-    const info = this.extractMediaInfo(message.media);
-    return {
-      fileName:
-        info?.fileName ??
-        reader.info.fileName ??
-        (info?.type === "photo" ? `telegram-photo-${messageId}.jpg` : `telegram-${messageId}.bin`),
-      sizeBytes: written,
-    };
+    return { fileName, sizeBytes: written };
+  }
+
+  /**
+   * One short step of a download that continues over several calls, so no call holds the
+   * account for long: offsetBytes 0 creates the file, a larger offset continues the partial
+   * file, which must hold exactly that many bytes. A step reads for about DOWNLOAD_STEP_MS
+   * and at most DOWNLOAD_STEP_MAX_BYTES. A failed first step leaves no file; a failed later
+   * step keeps the partial file, so the caller can retry from its size or delete it.
+   */
+  async downloadMediaStep(
+    chatId: string,
+    messageId: number,
+    downloadPath: string,
+    offsetBytes: number,
+    signal: AbortSignal | undefined = operationSignal(),
+  ): Promise<{ fileName: string; sizeBytes: number; totalBytes: number; done: boolean }> {
+    if (!Number.isSafeInteger(offsetBytes) || offsetBytes < 0)
+      throw new TelegramMediaError("INVALID_RANGE", "offsetBytes must be a non-negative integer.");
+    const { reader, fileName } = await this.locateMedia(chatId, messageId, offsetBytes > 0);
+    const totalBytes = reader.info.size;
+    const policy = mediaPolicy();
+    policy.checkDownloadSize(totalBytes);
+    if (offsetBytes > totalBytes)
+      throw new TelegramMediaError("INVALID_RANGE", `offsetBytes is past the end of the ${totalBytes}-byte file.`);
+    const output = offsetBytes
+      ? await policy.openPartial(downloadPath, offsetBytes)
+      : await policy.openOutput(downloadPath);
+    const started = Date.now();
+    let written = 0;
+    try {
+      written = await this.writeMedia(
+        reader,
+        output.handle,
+        offsetBytes,
+        policy,
+        signal,
+        // Stop before the next 512 KiB chunk could pass the step's reserved bytes.
+        (n) => Date.now() - started >= DOWNLOAD_STEP_MS || n + MEDIA_CHUNK_BYTES > DOWNLOAD_STEP_MAX_BYTES,
+      );
+      if (!offsetBytes && !written) throw new Error("Failed to download media");
+    } catch (e) {
+      await output.handle.close().catch(() => {});
+      if (!offsetBytes) await rm(output.path, { force: true });
+      throw e;
+    }
+    await output.handle.close();
+    const sizeBytes = offsetBytes + written;
+    return { fileName, sizeBytes, totalBytes, done: sizeBytes >= totalBytes };
+  }
+
+  /**
+   * Find a message's original file and open a reader for it. A continuing download step
+   * (`reuse`) skips the message lookup while the same file was located recently, so a long
+   * download does not call getMessages every two seconds.
+   */
+  private async locateMedia(
+    chatId: string,
+    messageId: number,
+    reuse: boolean,
+  ): Promise<{ reader: MediaReader; fileName: string }> {
+    if (!this.client || !this.connected) throw new Error(NOT_CONNECTED_ERROR);
+    const client = this.client;
+    const key = `${chatId}
+${messageId}`;
+    const recent = this.recentMedia;
+    let entry = reuse && recent?.key === key && Date.now() - recent.usedAt < RECENT_MEDIA_TTL_MS ? recent : undefined;
+    if (!entry) {
+      const message = await this.loadMediaMessage(chatId, messageId);
+      if (isKnownUndownloadable(message.media)) throw notDownloadable(message.media);
+      const source = describeMessageMedia(message.media);
+      const info = this.extractMediaInfo(message.media);
+      entry = {
+        key,
+        source,
+        usedAt: 0,
+        fileName:
+          info?.fileName ??
+          source.info.fileName ??
+          (info?.type === "photo" ? `telegram-photo-${messageId}.jpg` : `telegram-${messageId}.bin`),
+      };
+      this.recentMedia = entry;
+    }
+    entry.usedAt = Date.now();
+    const found = entry;
+    const reader = new MediaReader(client, found.source, async () => {
+      const fresh = await this.loadMediaSource(chatId, messageId);
+      // Keep a refreshed file reference for the next step, never a replaced file.
+      if (fresh.info.fileId === found.source.info.fileId) found.source = fresh;
+      return fresh;
+    });
+    return { reader, fileName: found.fileName };
+  }
+
+  /** Write the file from `offset` to the end (or until `stop` says so); returns the bytes written. */
+  private async writeMedia(
+    reader: MediaReader,
+    handle: FileHandle,
+    offset: number,
+    policy: FilePolicy,
+    signal: AbortSignal | undefined,
+    stop?: (written: number) => boolean,
+  ): Promise<number> {
+    let written = 0;
+    for await (const chunk of reader.stream(offset, signal)) {
+      policy.checkDownloadSize(offset + written + chunk.length);
+      let position = offset + written;
+      await writeAll(async (buffer, at, length) => {
+        const result = await handle.write(buffer, at, length, position);
+        position += result.bytesWritten;
+        return result;
+      }, chunk);
+      written += chunk.length;
+      if (stop?.(written)) break;
+    }
+    return written;
   }
 
   /** Load a message for media access, with coded errors for a missing message or media. */

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { DOWNLOAD_MEDIA_TOOL, downloadTimeoutMs } from "../file-policy.js";
 import { GlobalLock } from "../global-lock.js";
 import type { McpServerInternal } from "../ipc-protocol.js";
 import type { TelegramSessionStore } from "../telegram-session-store.js";
@@ -86,7 +85,6 @@ async function initialize(init: WorkerInit) {
   executor = new ToolExecutor({
     tools,
     lock,
-    toolTimeoutsMs: { [DOWNLOAD_MEDIA_TOOL]: downloadTimeoutMs() },
     onStuck,
     authorize: (name, args) =>
       policy.authorize(name, args, async (id) => {
