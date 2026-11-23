@@ -67,11 +67,13 @@ it("downloads have their own limit and are written to fresh files inside the roo
   }
 });
 
-it("download concurrency and the download time limit come from the env with safe bounds", () => {
+it("download concurrency stays below the worker count, and both download settings have safe bounds", () => {
   assert.equal(downloadConcurrency({}), 2);
   assert.equal(downloadConcurrency({ MCP_TELEGRAM_DOWNLOAD_CONCURRENCY: "3" }), 3);
   for (const bad of ["0", "65", "1.5", "x"])
     assert.throws(() => downloadConcurrency({ MCP_TELEGRAM_DOWNLOAD_CONCURRENCY: bad }), /Invalid/, bad);
+  assert.equal(downloadConcurrency({ MCP_TELEGRAM_DOWNLOAD_CONCURRENCY: "5", MCP_SAAS_MAX_WORKERS: "3" }), 2);
+  assert.equal(downloadConcurrency({ MCP_SAAS_MAX_WORKERS: "1" }), 1, "at least one turn, even with one worker");
   assert.equal(downloadTimeoutMs({}), 60 * 60000);
   assert.throws(() => downloadTimeoutMs({ MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS: "1000" }), /Invalid/);
 });

@@ -51,15 +51,17 @@ export const DOWNLOAD_STEP_MAX_BYTES = 64 * MIB;
 
 /**
  * Downloads the browser-link service fetches past their first step at once
- * (MCP_TELEGRAM_DOWNLOAD_CONCURRENCY, default 2, 1–64). Each holds its Telegram account's
- * worker between steps, so keep it below MCP_SAAS_MAX_WORKERS. Always one per account.
+ * (MCP_TELEGRAM_DOWNLOAD_CONCURRENCY, default 2, 1–64; always one per Telegram account).
+ * Each holds its account's worker between steps, so it stays below MCP_SAAS_MAX_WORKERS
+ * (default 4): at least one worker is always left for every other account.
  */
 export function downloadConcurrency(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MCP_TELEGRAM_DOWNLOAD_CONCURRENCY;
   const value = raw ? Number(raw) : 2;
   if (!Number.isSafeInteger(value) || value < 1 || value > 64)
     throw new Error("Invalid MCP_TELEGRAM_DOWNLOAD_CONCURRENCY");
-  return value;
+  const workers = Number(env.MCP_SAAS_MAX_WORKERS ?? 4);
+  return Number.isSafeInteger(workers) && workers >= 1 ? Math.min(value, Math.max(1, workers - 1)) : value;
 }
 
 export class FilePolicy {

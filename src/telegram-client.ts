@@ -240,7 +240,13 @@ function mediaKey(chatId: string, messageId: number): string {
 }
 
 /** A chunk read still waiting on Telegram when its download step ended, at this file offset. */
-type InflightRead = { offset: number; chunks: AsyncGenerator<Buffer>; pending: Promise<IteratorResult<Buffer>> };
+type InflightRead = {
+  offset: number;
+  chunks: AsyncGenerator<Buffer>;
+  pending: Promise<IteratorResult<Buffer>>;
+  /** The call the read started under; a read of a cancelled call fails, so it isn't resumed. */
+  signal?: AbortSignal;
+};
 
 /** The promise's value if it settles by `at` (epoch ms), otherwise undefined. */
 async function settledBy<T>(promise: Promise<T>, at: number): Promise<T | undefined> {
@@ -1477,8 +1483,10 @@ export class TelegramService {
       messageId,
       offsetBytes > 0 || waiting?.offset === 0,
     );
-    // Claim the waiting read if it is at this offset; one at another offset is dropped.
-    const resume = entry.inflight?.offset === offsetBytes ? entry.inflight : undefined;
+    // Claim the waiting read if it is at this offset and its call wasn't cancelled; any other
+    // waiting read is dropped.
+    const resume =
+      entry.inflight?.offset === offsetBytes && !entry.inflight.signal?.aborted ? entry.inflight : undefined;
     entry.inflight = undefined;
     const totalBytes = reader.info.size;
     const policy = mediaPolicy();
@@ -1490,7 +1498,7 @@ export class TelegramService {
       : await policy.openOutput(downloadPath);
     const started = Date.now();
     let chunkAt = started;
-    let result: { written: number; left?: InflightRead };
+    let result: { written: number; stalled: boolean; left?: InflightRead };
     try {
       result = await this.writeMedia(reader, output.handle, offsetBytes, policy, signal, {
         resume,
@@ -1508,7 +1516,7 @@ export class TelegramService {
         },
         stallAt: started + stallMs,
       });
-      if (!offsetBytes && !result.written && !result.left) throw new Error("Failed to download media");
+      if (!offsetBytes && !result.written && !result.stalled) throw new Error("Failed to download media");
     } catch (e) {
       await output.handle.close().catch(() => {});
       if (!offsetBytes) await rm(output.path, { force: true });
@@ -1524,7 +1532,7 @@ export class TelegramService {
       sizeBytes,
       totalBytes,
       done: sizeBytes >= totalBytes,
-      ...(result.left ? { stalled: true as const } : {}),
+      ...(result.stalled ? { stalled: true as const } : {}),
     };
   }
 
@@ -1582,19 +1590,23 @@ export class TelegramService {
     policy: FilePolicy,
     signal: AbortSignal | undefined,
     options: { stop?: (written: number) => boolean; stallAt?: number; resume?: InflightRead } = {},
-  ): Promise<{ written: number; left?: InflightRead }> {
+  ): Promise<{ written: number; stalled: boolean; left?: InflightRead }> {
     const chunks = options.resume?.chunks ?? reader.stream(offset, signal);
     let pending = options.resume?.pending;
     let written = 0,
+      stalled = false,
       left: InflightRead | undefined;
     try {
       for (;;) {
         pending ??= chunks.next();
         const next = options.stallAt === undefined ? await pending : await settledBy(pending, options.stallAt);
         if (!next) {
-          // Still waiting on Telegram: hand the read to the next step instead of dropping it.
+          // Still waiting on Telegram: hand the read to the next step instead of dropping it,
+          // unless this call was cancelled (the read then fails when Telegram answers).
           pending.catch(() => {});
-          left = { offset: offset + written, chunks, pending };
+          const readSignal = options.resume?.signal ?? signal;
+          if (!readSignal?.aborted) left = { offset: offset + written, chunks, pending, signal: readSignal };
+          stalled = true;
           break;
         }
         pending = undefined;
@@ -1614,9 +1626,9 @@ export class TelegramService {
       }
     } finally {
       // A generator with a read in flight can't be closed without waiting for that read.
-      if (!left) await chunks.return(undefined);
+      if (!stalled) await chunks.return(undefined);
     }
-    return { written, left };
+    return { written, stalled, left };
   }
 
   /** Load a message for media access, with coded errors for a missing message or media. */

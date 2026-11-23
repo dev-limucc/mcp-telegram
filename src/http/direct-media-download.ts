@@ -357,13 +357,13 @@ export class DirectMediaDownloads {
   ): Promise<string | undefined> {
     const tooLarge = () =>
       new PublicDownloadError(`The file is larger than the ${Math.floor(this.maxBytes / 1048576)} MiB download limit`);
-    // On a legacy path, a file that wasn't there before this download is ours to clean up.
-    const fresh =
-      !!t.legacyPath &&
-      (await lstat(t.path).then(
+    // On a legacy path, a file that wasn't there right before a first step is ours to clean up.
+    const absent = () =>
+      lstat(t.path).then(
         () => false,
         (e) => (e as NodeJS.ErrnoException).code === "ENOENT",
-      ));
+      );
+    let fresh = false;
     let offset = 0,
       failures = 0,
       stalls = 0,
@@ -375,9 +375,18 @@ export class DirectMediaDownloads {
       for (;;) {
         active.throwIfAborted();
         if (!release && (offset > 0 || stalls > 0)) {
-          release = await this.fetchTurn(selected, signal);
+          // Waiting for a turn is bounded too, so a link can't stay "preparing" indefinitely.
+          const waitLimit = AbortSignal.timeout(this.timeoutMs);
+          try {
+            release = await this.fetchTurn(selected, AbortSignal.any([signal, waitLimit]));
+          } catch (e) {
+            if (!signal.aborted && waitLimit.aborted)
+              throw new PublicDownloadError("Other large downloads are still running; try again later");
+            throw e;
+          }
           active = AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]);
         }
+        if (!offset && t.legacyPath) fresh = await absent();
         // Access is re-checked between steps, so revoking it stops a background download too.
         await this.allowed(t);
         let result: { isError?: boolean; content?: Array<{ text?: unknown }>; structuredContent?: StepResult };

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -41,6 +42,9 @@ type SetupOptions = {
   crash?: Array<{ offset: number; message: string; partial?: number }>;
   /** Answer this many steps after the first with "stalled" and no new bytes. */
   stall?: number;
+  /** Answer this many first steps with "stalled", nothing written and no file created. */
+  stallFirst?: number;
+  timeoutMs?: number;
   maxFetching?: number;
 };
 async function setup(bytes = Buffer.from("original Telegram file"), options: SetupOptions = {}) {
@@ -51,7 +55,8 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
     now = 1000,
     flaky = options.flaky ?? 0,
     busy = options.busy ?? 0,
-    stall = options.stall ?? 0;
+    stall = options.stall ?? 0,
+    stallFirst = options.stallFirst ?? 0;
   const calls: Array<{ accountId: string; args: Record<string, unknown> }> = [];
   const identity = {
     kind: "saas",
@@ -73,6 +78,19 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
       if (busy > 0) {
         busy--;
         throw new Error("Telegram worker busy: queue deadline exceeded");
+      }
+      if (offset === 0 && stallFirst > 0) {
+        stallFirst--;
+        return {
+          content: [],
+          structuredContent: {
+            fileName: "отчёт.pdf",
+            sizeBytes: 0,
+            totalBytes: bytes.length,
+            done: false,
+            stalled: true,
+          },
+        };
       }
       const crash = options.crash?.findIndex((c) => c.offset === offset) ?? -1;
       if (crash >= 0) {
@@ -141,6 +159,7 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
     waitMs: options.waitMs,
     retryDelayMs: 1,
     maxFetching: options.maxFetching,
+    timeoutMs: options.timeoutMs,
   });
   await downloads.initialize();
   const app = express();
@@ -706,6 +725,45 @@ test("a download gives up after Telegram sends nothing for many steps in a row",
     await assert.rejects(s.downloads.create(owner, "grant", input), /stopped sending the file/);
     assert.equal(s.calls.length, 1 + 30);
   } finally {
+    await s.close();
+  }
+});
+
+test("a legacy path is checked again before each first step, so a file that appeared later is never removed", async () => {
+  let path = "";
+  const s = await setup(undefined, {
+    stallFirst: 1,
+    // The caller's own file appears while the download waits after its stalled first step;
+    // the next first step's answer is then lost.
+    onStep: () => {
+      if (s.calls.length === 1) writeFileSync(path, "the caller's own file");
+    },
+    crash: [{ offset: 0, message: "Worker request cancelled" }],
+  });
+  try {
+    path = join(s.root, owner, "lecture.mp4");
+    await mkdir(join(s.root, owner), { recursive: true });
+    await assert.rejects(s.downloads.create(owner, "grant", { ...input, downloadPath: path }));
+    assert.equal(await readFile(path, "utf8"), "the caller's own file");
+  } finally {
+    await s.close();
+  }
+});
+
+test("waiting for a turn is bounded, so a link can't stay preparing indefinitely", async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold, maxFetching: 1, timeoutMs: 100 });
+  try {
+    await s.downloads.create(owner, "grant", input);
+    const waiting = await s.downloads.create(owner, "grant", { ...input, telegramAccountId: selected });
+    await until(async () => (await fetch(s.url(waiting), { headers: s.headers(waiting) })).status === 502);
+    const response = await fetch(s.url(waiting), { headers: s.headers(waiting) });
+    assert.match((await response.json()).error, /Other large downloads are still running/);
+  } finally {
+    release();
     await s.close();
   }
 });

@@ -185,3 +185,86 @@ test("a step that Telegram leaves waiting returns as stalled, and the next step 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a waiting read is resumed only when it is sound: not after a cancelled call, not at another offset, and a failed one is replaced", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-download-resume-"));
+  const bytes = Buffer.from(Array.from({ length: 3 * 524288 }, (_, i) => i % 233));
+  const document = new Api.Document({
+    id: bigInt(1),
+    accessHash: bigInt(2),
+    fileReference: Buffer.alloc(0),
+    date: 1,
+    mimeType: "video/mp4",
+    size: bigInt(bytes.length),
+    dcId: 1,
+    attributes: [new Api.DocumentAttributeFilename({ fileName: "lecture.mp4" })],
+  });
+  const requested: number[] = [];
+  // The next request waits for the test to answer it (resolve) or fail it (reject).
+  let parked: { resolve: () => void; reject: (e: Error) => void } | undefined;
+  let park = false;
+  const service = new TelegramService(1, "fixture");
+  Object.assign(service, {
+    connected: true,
+    client: {
+      getMessages: async () => [{ media: new Api.MessageMediaDocument({ document }) }],
+      getSender: async (dcId: number) => ({ dcId }),
+      invokeWithSender: async (req: Api.upload.GetFile) => {
+        const offset = Number(req.offset.toString());
+        requested.push(offset);
+        if (park) {
+          park = false;
+          await new Promise<void>((resolve, reject) => {
+            parked = { resolve, reject };
+          });
+        }
+        return new Api.upload.File({
+          type: new Api.storage.FileUnknown(),
+          mtime: 0,
+          bytes: bytes.subarray(offset, offset + req.limit),
+        });
+      },
+    },
+  });
+  const step = (path: string, offset: number, signal?: AbortSignal) =>
+    service.downloadMediaStep("@me", 7, path, offset, signal, 50);
+  try {
+    // 1. A step whose call is cancelled while it waits keeps no read: its read would fail.
+    const a = join(root, "a.mp4");
+    const cancelled = new AbortController();
+    park = true;
+    const first = step(a, 0, cancelled.signal);
+    setTimeout(() => cancelled.abort(), 10);
+    assert.equal((await first).stalled, true);
+    parked?.resolve();
+    assert.equal((await step(a, 0)).done, true);
+    assert.deepEqual(requested.slice(0, 2), [0, 0], "a new read replaced the cancelled one");
+    assert.deepEqual(await readFile(a), bytes);
+
+    // 2. A waiting read that fails when it resumes is reported, and the next step reads anew.
+    requested.length = 0;
+    const b = join(root, "b.mp4");
+    park = true;
+    assert.equal((await step(b, 0)).stalled, true);
+    parked?.reject(new Error("connection reset"));
+    await assert.rejects(step(b, 0), /connection reset/);
+    assert.equal((await step(b, 0)).done, true);
+    assert.deepEqual(await readFile(b), bytes);
+    assert.deepEqual(requested.slice(0, 2), [0, 0]);
+
+    // 3. A waiting read at another offset than the step asks for is dropped, never written.
+    requested.length = 0;
+    const c = join(root, "c.mp4");
+    await writeFile(c, bytes.subarray(0, 1048576));
+    park = true;
+    assert.equal((await step(c, 1048576)).stalled, true);
+    await writeFile(c, bytes.subarray(0, 524288));
+    const resumedElsewhere = await step(c, 524288);
+    parked?.resolve();
+    assert.equal(resumedElsewhere.done, true);
+    assert.deepEqual(await readFile(c), bytes);
+    assert.deepEqual(requested, [1048576, 524288, 1048576], "the read at 1 MiB was not reused at 512 KiB");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
