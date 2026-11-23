@@ -3,7 +3,7 @@ import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { FilePolicy, maxDownloadBytes } from "../file-policy.js";
+import { downloadConcurrency, downloadTimeoutMs, FilePolicy, maxDownloadBytes } from "../file-policy.js";
 import { TelegramService } from "../telegram-client.js";
 
 it("confines media to its root, rejects escapes/URLs/devices and limits size", async () => {
@@ -65,4 +65,13 @@ it("downloads have their own limit and are written to fresh files inside the roo
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+it("download concurrency and the download time limit come from the env with safe bounds", () => {
+  assert.equal(downloadConcurrency({}), 2);
+  assert.equal(downloadConcurrency({ MCP_TELEGRAM_DOWNLOAD_CONCURRENCY: "3" }), 3);
+  for (const bad of ["0", "65", "1.5", "x"])
+    assert.throws(() => downloadConcurrency({ MCP_TELEGRAM_DOWNLOAD_CONCURRENCY: bad }), /Invalid/, bad);
+  assert.equal(downloadTimeoutMs({}), 60 * 60000);
+  assert.throws(() => downloadTimeoutMs({ MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS: "1000" }), /Invalid/);
 });

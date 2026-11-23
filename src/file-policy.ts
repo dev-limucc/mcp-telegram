@@ -22,8 +22,8 @@ export const DOWNLOAD_MEDIA_TOOL = "telegram-download-media";
 /**
  * How long one whole media download may take (MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS, default
  * 60 min, 30 s – 6 h). The browser-link service downloads in short steps (see
- * DOWNLOAD_STEP_MS) and applies this to the sum of them; an owner's single-call download
- * gets it as its tool deadline. Every other tool keeps its short deadline.
+ * DOWNLOAD_STEP_MS) and applies this from the moment a download gets its turn; an owner's
+ * single-call download gets it as its tool deadline. Every other tool keeps its short deadline.
  */
 export function downloadTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS;
@@ -42,11 +42,25 @@ export const DOWNLOAD_STEP_MS = 2000;
 export const DOWNLOAD_STEP_HOLD_MS = 3500;
 /**
  * A step whose next chunk hasn't arrived after this long returns early as "stalled" (a slow
- * link or a Telegram flood wait), well inside the 28 s tool deadline.
+ * link or a Telegram flood wait), so it holds the account for less than the 5 s other calls
+ * wait. The read itself continues, and the next step picks it up.
  */
-export const DOWNLOAD_STEP_STALL_MS = 8000;
+export const DOWNLOAD_STEP_STALL_MS = 3000;
 /** One download step writes at most this much (the supervisor reserves it per step). */
 export const DOWNLOAD_STEP_MAX_BYTES = 64 * MIB;
+
+/**
+ * Downloads the browser-link service fetches past their first step at once
+ * (MCP_TELEGRAM_DOWNLOAD_CONCURRENCY, default 2, 1–64). Each holds its Telegram account's
+ * worker between steps, so keep it below MCP_SAAS_MAX_WORKERS. Always one per account.
+ */
+export function downloadConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MCP_TELEGRAM_DOWNLOAD_CONCURRENCY;
+  const value = raw ? Number(raw) : 2;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 64)
+    throw new Error("Invalid MCP_TELEGRAM_DOWNLOAD_CONCURRENCY");
+  return value;
+}
 
 export class FilePolicy {
   private readonly root?: string;

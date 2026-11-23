@@ -20,6 +20,8 @@ type SetupOptions = {
   waitMs?: number;
   /** Write the first part, then wait for this before writing the rest (a slow Telegram download). */
   hold?: Promise<void>;
+  /** Apply hold/fail only to this message (default: every message). */
+  holdMessage?: number;
   /** Fail the worker call after writing the first part. */
   fail?: Promise<void>;
   /** Bytes one download step writes (default: the whole file in one step). */
@@ -98,7 +100,8 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
         if (offset === 0) await writeFile(path, Buffer.alloc(0), { flag: "wx", mode: 0o600 });
         else assert.equal((await stat(path)).size, offset, "each step continues the partial file");
         let end = Math.min(bytes.length, offset + (options.stepBytes ?? bytes.length));
-        if (options.hold || options.fail) {
+        const held = options.holdMessage === undefined || options.holdMessage === args.messageId;
+        if (held && (options.hold || options.fail)) {
           // The first step brings half the file; the next one waits for the test.
           if (offset === 0) end = Math.floor(bytes.length / 2);
           else if (options.fail) {
@@ -588,6 +591,7 @@ test("failures arrive as the supervisor reports them and are retried only where 
       /could not be downloaded/,
     );
     assert.equal(legacy.calls.length, 1, "a legacy path's first step is retried only when the worker never saw it");
+    await assert.rejects(stat(path), { code: "ENOENT" }, "the partial file this download created is removed");
   } finally {
     await legacy.close();
   }
@@ -618,27 +622,89 @@ test("stalled steps wait and continue instead of failing", async () => {
   }
 });
 
-test("one download per Telegram account and a few in total fetch at once; the rest wait their turn", async () => {
+const pathOf = (ticket: { downloadUrl: string }) => new URL(ticket.downloadUrl).pathname.split("/").pop() as string;
+const continuedPaths = (calls: Array<{ args: Record<string, unknown> }>) =>
+  new Set(calls.filter((c) => (c.args.offsetBytes as number) > 0).map((c) => c.args.downloadPath));
+
+test("a file one step finishes never waits behind a long download", async () => {
   let release!: () => void;
   const hold = new Promise<void>((r) => {
     release = r;
   });
-  const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold, maxFetching: 1 });
+  const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold, holdMessage: 7, maxFetching: 1 });
   try {
-    const first = await s.downloads.create(owner, "grant", input);
-    const sameAccount = await s.downloads.create(owner, "grant", input);
-    const otherAccount = await s.downloads.create(owner, "grant", { ...input, telegramAccountId: selected });
-    for (const ticket of [first, sameAccount, otherAccount]) assert.equal(ticket.status, "preparing");
-    assert.equal(new Set(s.calls.map((c) => c.args.downloadPath)).size, 1, "only the first one reached a worker");
-    const waiting = await fetch(s.url(sameAccount), { headers: s.headers(sameAccount) });
-    assert.equal(waiting.status, 202);
-    assert.equal((await waiting.json()).receivedBytes, 0);
+    const long = await s.downloads.create(owner, "grant", input);
+    assert.equal(long.status, "preparing");
+    const small = await s.downloads.create(owner, "grant", { ...input, messageId: 8 });
+    assert.equal(small.status, "ready", "same account and the only turn taken, yet no wait");
+    assert.equal(small.sizeBytes, 4096);
+  } finally {
     release();
-    for (const ticket of [first, sameAccount, otherAccount])
-      await until(
-        async () => (await fetch(s.url(ticket), { method: "HEAD", headers: s.headers(ticket) })).status === 200,
+    await s.close();
+  }
+});
+
+test("past their first step, downloads take turns: one per Telegram account, a few in total", async () => {
+  for (const maxFetching of [2, 1]) {
+    let release!: () => void;
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold, maxFetching });
+    try {
+      const first = await s.downloads.create(owner, "grant", input);
+      const sameAccount = await s.downloads.create(owner, "grant", input);
+      const otherAccount = await s.downloads.create(owner, "grant", { ...input, telegramAccountId: selected });
+      for (const ticket of [first, sameAccount, otherAccount]) assert.equal(ticket.status, "preparing");
+      assert.equal(s.calls.filter((c) => c.args.offsetBytes === 0).length, 3, "every first step ran at once");
+      const continued = [...continuedPaths(s.calls)].map(String);
+      assert.ok(continued.some((path) => path.includes(pathOf(first))));
+      assert.ok(!continued.some((path) => path.includes(pathOf(sameAccount))), "one download per account");
+      assert.equal(
+        continued.some((path) => path.includes(pathOf(otherAccount))),
+        maxFetching === 2,
+        `another account continues only while a turn is free (maxFetching ${maxFetching})`,
       );
-    assert.equal(new Set(s.calls.map((c) => c.args.downloadPath)).size, 3);
+      const waiting = await fetch(s.url(sameAccount), { headers: s.headers(sameAccount) });
+      assert.equal(waiting.status, 202);
+      assert.equal((await waiting.json()).receivedBytes, 2048, "the first step's bytes are already there");
+      release();
+      for (const ticket of [first, sameAccount, otherAccount])
+        await until(
+          async () => (await fetch(s.url(ticket), { method: "HEAD", headers: s.headers(ticket) })).status === 200,
+        );
+      assert.equal(continuedPaths(s.calls).size, 3);
+    } finally {
+      release();
+      await s.close();
+    }
+  }
+});
+
+test("closing the service cancels downloads still waiting for their turn", async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold });
+  try {
+    await s.downloads.create(owner, "grant", input);
+    const queued = await s.downloads.create(owner, "grant", input);
+    s.downloads.stop();
+    release();
+    await s.downloads.close();
+    assert.ok(![...continuedPaths(s.calls)].some((path) => String(path).includes(pathOf(queued))));
+  } finally {
+    release();
+    await s.close();
+  }
+});
+
+test("a download gives up after Telegram sends nothing for many steps in a row", async () => {
+  const s = await setup(Buffer.alloc(3000, 9), { stepBytes: 1000, stall: 1000 });
+  try {
+    await assert.rejects(s.downloads.create(owner, "grant", input), /stopped sending the file/);
+    assert.equal(s.calls.length, 1 + 30);
   } finally {
     await s.close();
   }

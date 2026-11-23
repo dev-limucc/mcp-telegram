@@ -19,7 +19,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Express, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
-import { downloadTimeoutMs, FilePolicy, maxDownloadBytes } from "../file-policy.js";
+import { downloadConcurrency, downloadTimeoutMs, FilePolicy, maxDownloadBytes } from "../file-policy.js";
 import type { McpRegisteredTool } from "../ipc-protocol.js";
 import { validateMediaName } from "../media-upload.js";
 import { isSafeAbsolutePath, WRITE } from "../tools/shared.js";
@@ -36,17 +36,10 @@ const TRANSFER_MAX_MS = 2 * 3600000;
 const TRANSFER_IDLE_MS = 60000;
 /** A running transfer re-checks the link's grant and policy this often. */
 const RECHECK_MS = 2000;
-/**
- * Downloads fetching from Telegram at once, in total (one per Telegram account). Each holds its
- * account's worker, and the supervisor runs only a few, so the rest wait their turn.
- */
-const MAX_FETCHING = 2;
 /** A download step that fails after progress is retried this many times from the partial file. */
 const STEP_RETRIES = 3;
-/** A first step that failed in the worker or on its way (not refused by it) is retried this often. */
-const FIRST_STEP_RETRIES = 2;
-/** Stalled steps in a row (Telegram sent nothing for a whole step) before the download gives up. */
-const MAX_STALLS = 12;
+/** Stalled steps in a row (no new chunk for a whole step, about 5 s each) before giving up. */
+const MAX_STALLS = 30;
 /** Refusals that never reached the worker, so no file was touched. */
 const BEFORE_WORKER = /^Telegram worker (busy|capacity reached)/;
 /** Refusals that retrying can't fix. */
@@ -127,7 +120,7 @@ interface Options {
   timeoutMs?: number;
   /** Pause before retrying a failed download step (default 1 s, doubled per retry; 5x after a stall). */
   retryDelayMs?: number;
-  /** Downloads fetching from Telegram at once (default 2; always one per Telegram account). */
+  /** Downloads continuing past their first step at once (default MCP_TELEGRAM_DOWNLOAD_CONCURRENCY or 2). */
   maxFetching?: number;
 }
 type Created = {
@@ -170,7 +163,7 @@ export class DirectMediaDownloads {
     this.waitMs = options.waitMs ?? WAIT_MS;
     this.timeoutMs = options.timeoutMs ?? downloadTimeoutMs();
     this.retryDelayMs = options.retryDelayMs ?? 1000;
-    this.maxFetching = options.maxFetching ?? MAX_FETCHING;
+    this.maxFetching = options.maxFetching ?? downloadConcurrency();
   }
   initialize(): Promise<void> {
     if (!this.initialized)
@@ -244,7 +237,8 @@ export class DirectMediaDownloads {
     // call answers "preparing". The caller's signal only cancels it until that hand-off.
     const controller = new AbortController();
     this.controllers.add(controller);
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs)]);
+    // The time limit starts when the download gets its turn (fetchSteps), not while it waits.
+    const signal = controller.signal;
     const cancel = () => controller.abort(options?.signal?.reason);
     if (options?.signal?.aborted) cancel();
     else options?.signal?.addEventListener("abort", cancel, { once: true });
@@ -321,15 +315,12 @@ export class DirectMediaDownloads {
       await this.marker(t);
     }
     let workerFileName: string | undefined;
-    const release = await this.fetchTurn(selected, signal);
     try {
       workerFileName = await this.fetchSteps(t, args, selected, signal);
     } catch (e) {
       // A legacy path is kept by design, but never a partial file this download created.
       if (t.legacyPath && t.created) await rm(t.path, { force: true });
       throw e;
-    } finally {
-      release();
     }
     signal.throwIfAborted();
     await this.allowed(t);
@@ -353,8 +344,10 @@ export class DirectMediaDownloads {
   }
   /**
    * Fetch the file in short steps (offsetBytes), each of which holds the account's worker for
-   * about two seconds, so the account's other tool calls get their turn while a large file
-   * downloads. A step that fails after progress is retried from the partial file's size.
+   * a few seconds, so the account's other tool calls get their turn while a large file
+   * downloads. A file the first step finishes never queues; continuing past it waits for a
+   * turn (fetchTurn), and the time limit runs from then. A step that fails after progress is
+   * retried from the partial file's size.
    */
   private async fetchSteps(
     t: Ticket,
@@ -364,82 +357,105 @@ export class DirectMediaDownloads {
   ): Promise<string | undefined> {
     const tooLarge = () =>
       new PublicDownloadError(`The file is larger than the ${Math.floor(this.maxBytes / 1048576)} MiB download limit`);
+    // On a legacy path, a file that wasn't there before this download is ours to clean up.
+    const fresh =
+      !!t.legacyPath &&
+      (await lstat(t.path).then(
+        () => false,
+        (e) => (e as NodeJS.ErrnoException).code === "ENOENT",
+      ));
     let offset = 0,
       failures = 0,
       stalls = 0,
-      fileName: string | undefined;
-    for (;;) {
-      signal.throwIfAborted();
-      // Access is re-checked between steps, so revoking it stops a background download too.
-      await this.allowed(t);
-      let result: { isError?: boolean; content?: Array<{ text?: unknown }>; structuredContent?: StepResult };
-      let refused = false;
-      try {
-        result = (await this.options.identity.callTool(
-          t.owner,
-          DOWNLOAD_TOOL,
-          {
-            chatId: args.chatId,
-            messageId: args.messageId,
-            telegramAccountId: selected,
-            downloadPath: t.path,
-            offsetBytes: offset,
-          },
-          { signal },
-        )) as typeof result;
-        if (result.isError) {
-          if (String(result.content?.[0]?.text ?? "").includes("exceeds configured download limit")) throw tooLarge();
-          refused = true;
-          throw new Error("Telegram media could not be downloaded");
+      fileName: string | undefined,
+      release: (() => void) | undefined,
+      // The download's own signal; once it has its turn, also its time limit.
+      active = signal;
+    try {
+      for (;;) {
+        active.throwIfAborted();
+        if (!release && (offset > 0 || stalls > 0)) {
+          release = await this.fetchTurn(selected, signal);
+          active = AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]);
         }
-      } catch (e) {
-        signal.throwIfAborted();
-        const message = e instanceof Error ? e.message : "";
-        let retry: boolean;
-        if (e instanceof PublicDownloadError || FINAL.test(message)) retry = false;
-        // Progress was made, so the media and access were fine and the partial file is intact.
-        else if (offset) retry = true;
-        // The worker refused the first step: no media, no access, or the file already exists.
-        else if (refused) retry = false;
-        // The first step failed in the worker or on the way (busy, restarted, timed out). Our
-        // own storage is started over; a legacy path only when the worker never saw the call.
-        else retry = !!t.dir || BEFORE_WORKER.test(message);
-        if (!retry || ++failures > (offset ? STEP_RETRIES : FIRST_STEP_RETRIES)) throw e;
-        await this.pause(this.retryDelayMs * 2 ** (failures - 1), signal);
-        // A later step continues from what reached the disk (the failed step has settled by the
-        // time the next one runs). A first step always restarts at 0, which only creates a file.
-        if (offset) offset = await this.received(t);
-        else if (t.dir) await rm(t.path, { force: true });
-        continue;
-      }
-      const step = result.structuredContent ?? {};
-      const { sizeBytes, totalBytes } = step;
-      if (
-        typeof sizeBytes !== "number" ||
-        typeof totalBytes !== "number" ||
-        !Number.isSafeInteger(sizeBytes) ||
-        !Number.isSafeInteger(totalBytes) ||
-        sizeBytes < offset ||
-        sizeBytes > totalBytes
-      )
-        throw new Error("Invalid download size");
-      if (totalBytes > this.maxBytes) throw tooLarge();
-      if (sizeBytes > 0) t.created = true;
-      failures = 0;
-      if (typeof step.fileName === "string") fileName = step.fileName;
-      if (step.done === true) return fileName;
-      if (step.stalled === true) {
-        // Telegram sent nothing for a whole step (a slow link or a flood wait): wait outside the
-        // worker, then continue. Progress resets the count.
-        stalls = sizeBytes > offset ? 0 : stalls + 1;
-        if (stalls >= MAX_STALLS) throw new PublicDownloadError("Telegram stopped sending the file; try again later");
+        // Access is re-checked between steps, so revoking it stops a background download too.
+        await this.allowed(t);
+        let result: { isError?: boolean; content?: Array<{ text?: unknown }>; structuredContent?: StepResult };
+        let refused = false;
+        try {
+          result = (await this.options.identity.callTool(
+            t.owner,
+            DOWNLOAD_TOOL,
+            {
+              chatId: args.chatId,
+              messageId: args.messageId,
+              telegramAccountId: selected,
+              downloadPath: t.path,
+              offsetBytes: offset,
+            },
+            { signal: active },
+          )) as typeof result;
+          if (result.isError) {
+            if (String(result.content?.[0]?.text ?? "").includes("exceeds configured download limit")) throw tooLarge();
+            refused = true;
+            throw new Error("Telegram media could not be downloaded");
+          }
+        } catch (e) {
+          active.throwIfAborted();
+          const message = e instanceof Error ? e.message : "";
+          const beforeWorker = BEFORE_WORKER.test(message) || FINAL.test(message);
+          let retry: boolean;
+          if (e instanceof PublicDownloadError || FINAL.test(message)) retry = false;
+          // Progress was made, so the media and access were fine and the partial file is intact.
+          else if (offset) retry = true;
+          // The worker refused the first step: no media, no access, or the file already exists.
+          else if (refused) retry = false;
+          // The first step failed in the worker or on the way (busy, restarted, timed out). Our
+          // own storage is started over; a legacy path only when the worker never saw the call.
+          else retry = !!t.dir || beforeWorker;
+          if (!retry || ++failures > STEP_RETRIES) {
+            // A first step on a legacy path whose answer was lost may have created the file there.
+            if (!offset && fresh && !refused && !beforeWorker && !(e instanceof PublicDownloadError)) t.created = true;
+            throw e;
+          }
+          await this.pause(this.retryDelayMs * 2 ** (failures - 1), active);
+          // A later step continues from what reached the disk (the failed step has settled by the
+          // time the next one runs). A first step always restarts at 0, which only creates a file.
+          if (offset) offset = await this.received(t);
+          else if (t.dir) await rm(t.path, { force: true });
+          continue;
+        }
+        const step = result.structuredContent ?? {};
+        const { sizeBytes, totalBytes } = step;
+        if (
+          typeof sizeBytes !== "number" ||
+          typeof totalBytes !== "number" ||
+          !Number.isSafeInteger(sizeBytes) ||
+          !Number.isSafeInteger(totalBytes) ||
+          sizeBytes < offset ||
+          sizeBytes > totalBytes
+        )
+          throw new Error("Invalid download size");
+        if (totalBytes > this.maxBytes) throw tooLarge();
+        if (sizeBytes > 0) t.created = true;
+        failures = 0;
+        if (typeof step.fileName === "string") fileName = step.fileName;
+        if (step.done === true) return fileName;
+        if (step.stalled === true) {
+          // No new chunk for a whole step (a slow link or a flood wait). The worker keeps that
+          // read going; wait outside the worker, then pick it up. Progress resets the count.
+          stalls = sizeBytes > offset ? 0 : stalls + 1;
+          if (stalls >= MAX_STALLS) throw new PublicDownloadError("Telegram stopped sending the file; try again later");
+          offset = sizeBytes;
+          await this.pause(this.retryDelayMs * 2, active);
+          continue;
+        }
+        if (sizeBytes === offset) throw new Error("Telegram media download made no progress");
+        stalls = 0;
         offset = sizeBytes;
-        await this.pause(this.retryDelayMs * 5, signal);
-        continue;
       }
-      if (sizeBytes === offset) throw new Error("Telegram media download made no progress");
-      stalls = 0;
-      offset = sizeBytes;
+    } finally {
+      release?.();
     }
   }
   /** Wait, or stop at once with the download's own reason when it is cancelled or times out. */
