@@ -17,7 +17,14 @@ import { getInputUser, getPeerId } from "telegram/Utils.js";
 import { boundedMap } from "./bounded-map.js";
 import { type CallStatus, PrivateCallManager } from "./calls/private-call.js";
 import { SingleFlight } from "./connection-lifecycle.js";
-import { DOWNLOAD_STEP_MAX_BYTES, DOWNLOAD_STEP_MS, type FilePolicy, mediaPolicy } from "./file-policy.js";
+import {
+  DOWNLOAD_STEP_HOLD_MS,
+  DOWNLOAD_STEP_MAX_BYTES,
+  DOWNLOAD_STEP_MS,
+  DOWNLOAD_STEP_STALL_MS,
+  type FilePolicy,
+  mediaPolicy,
+} from "./file-policy.js";
 import {
   describeMessageMedia,
   isKnownUndownloadable,
@@ -226,6 +233,21 @@ const NOT_CONNECTED_ERROR = "Not connected. Run telegram-status to check or tele
 const MEDIA_CHUNK_BYTES = 512 * 1024;
 /** A located file is reused by the next download step for this long after its last use. */
 const RECENT_MEDIA_TTL_MS = 2 * 60000;
+
+/** The promise's value if it settles by `at` (epoch ms), otherwise undefined. */
+async function settledBy<T>(promise: Promise<T>, at: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), Math.max(0, at - Date.now()));
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Telegram's invite-bearing requests (`messages.createChat`, `messages.addChatUser`,
@@ -1401,7 +1423,7 @@ export class TelegramService {
     const output = await policy.openOutput(downloadPath);
     let written = 0;
     try {
-      written = await this.writeMedia(reader, output.handle, 0, policy, signal);
+      ({ written } = await this.writeMedia(reader, output.handle, 0, policy, signal));
       if (!written) throw new Error("Failed to download media");
     } catch (e) {
       await output.handle.close().catch(() => {});
@@ -1416,8 +1438,11 @@ export class TelegramService {
    * One short step of a download that continues over several calls, so no call holds the
    * account for long: offsetBytes 0 creates the file, a larger offset continues the partial
    * file, which must hold exactly that many bytes. A step reads for about DOWNLOAD_STEP_MS
-   * and at most DOWNLOAD_STEP_MAX_BYTES. A failed first step leaves no file; a failed later
-   * step keeps the partial file, so the caller can retry from its size or delete it.
+   * and at most DOWNLOAD_STEP_MAX_BYTES. When Telegram sends nothing for `stallMs` (GramJS
+   * sleeps through a FLOOD_WAIT of up to a minute and can't be interrupted) the step returns
+   * early with `stalled`, long before the tool deadline, and the caller waits and continues.
+   * A failed or empty first step leaves no file; a failed later step keeps the partial file,
+   * so the caller can retry from its size or delete it.
    */
   async downloadMediaStep(
     chatId: string,
@@ -1425,7 +1450,8 @@ export class TelegramService {
     downloadPath: string,
     offsetBytes: number,
     signal: AbortSignal | undefined = operationSignal(),
-  ): Promise<{ fileName: string; sizeBytes: number; totalBytes: number; done: boolean }> {
+    stallMs = DOWNLOAD_STEP_STALL_MS,
+  ): Promise<{ fileName: string; sizeBytes: number; totalBytes: number; done: boolean; stalled?: true }> {
     if (!Number.isSafeInteger(offsetBytes) || offsetBytes < 0)
       throw new TelegramMediaError("INVALID_RANGE", "offsetBytes must be a non-negative integer.");
     const { reader, fileName } = await this.locateMedia(chatId, messageId, offsetBytes > 0);
@@ -1438,26 +1464,41 @@ export class TelegramService {
       ? await policy.openPartial(downloadPath, offsetBytes)
       : await policy.openOutput(downloadPath);
     const started = Date.now();
-    let written = 0;
+    let chunkAt = started;
+    let result: { written: number; stalled: boolean };
     try {
-      written = await this.writeMedia(
-        reader,
-        output.handle,
-        offsetBytes,
-        policy,
-        signal,
-        // Stop before the next 512 KiB chunk could pass the step's reserved bytes.
-        (n) => Date.now() - started >= DOWNLOAD_STEP_MS || n + MEDIA_CHUNK_BYTES > DOWNLOAD_STEP_MAX_BYTES,
-      );
-      if (!offsetBytes && !written) throw new Error("Failed to download media");
+      result = await this.writeMedia(reader, output.handle, offsetBytes, policy, signal, {
+        // Stop after DOWNLOAD_STEP_MS, or earlier when the next chunk would likely keep the
+        // account past DOWNLOAD_STEP_HOLD_MS, or would pass the step's reserved bytes.
+        stop: (n) => {
+          const now = Date.now(),
+            chunkMs = now - chunkAt;
+          chunkAt = now;
+          return (
+            now - started >= DOWNLOAD_STEP_MS ||
+            now - started + chunkMs > DOWNLOAD_STEP_HOLD_MS ||
+            n + MEDIA_CHUNK_BYTES > DOWNLOAD_STEP_MAX_BYTES
+          );
+        },
+        stallAt: started + stallMs,
+      });
+      if (!offsetBytes && !result.written && !result.stalled) throw new Error("Failed to download media");
     } catch (e) {
       await output.handle.close().catch(() => {});
       if (!offsetBytes) await rm(output.path, { force: true });
       throw e;
     }
     await output.handle.close();
-    const sizeBytes = offsetBytes + written;
-    return { fileName, sizeBytes, totalBytes, done: sizeBytes >= totalBytes };
+    // An empty first step leaves no file, so the caller simply starts at 0 again.
+    if (!offsetBytes && !result.written) await rm(output.path, { force: true });
+    const sizeBytes = offsetBytes + result.written;
+    return {
+      fileName,
+      sizeBytes,
+      totalBytes,
+      done: sizeBytes >= totalBytes,
+      ...(result.stalled ? { stalled: true as const } : {}),
+    };
   }
 
   /**
@@ -1472,8 +1513,7 @@ export class TelegramService {
   ): Promise<{ reader: MediaReader; fileName: string }> {
     if (!this.client || !this.connected) throw new Error(NOT_CONNECTED_ERROR);
     const client = this.client;
-    const key = `${chatId}
-${messageId}`;
+    const key = JSON.stringify([chatId, messageId]);
     const recent = this.recentMedia;
     let entry = reuse && recent?.key === key && Date.now() - recent.usedAt < RECENT_MEDIA_TTL_MS ? recent : undefined;
     if (!entry) {
@@ -1503,28 +1543,48 @@ ${messageId}`;
     return { reader, fileName: found.fileName };
   }
 
-  /** Write the file from `offset` to the end (or until `stop` says so); returns the bytes written. */
+  /**
+   * Write the file from `offset` to the end, or until `stop` says so after a chunk, or until no
+   * chunk has arrived by `stallAt` (then `stalled`). Returns the bytes written.
+   */
   private async writeMedia(
     reader: MediaReader,
     handle: FileHandle,
     offset: number,
     policy: FilePolicy,
     signal: AbortSignal | undefined,
-    stop?: (written: number) => boolean,
-  ): Promise<number> {
-    let written = 0;
-    for await (const chunk of reader.stream(offset, signal)) {
-      policy.checkDownloadSize(offset + written + chunk.length);
-      let position = offset + written;
-      await writeAll(async (buffer, at, length) => {
-        const result = await handle.write(buffer, at, length, position);
-        position += result.bytesWritten;
-        return result;
-      }, chunk);
-      written += chunk.length;
-      if (stop?.(written)) break;
+    options: { stop?: (written: number) => boolean; stallAt?: number } = {},
+  ): Promise<{ written: number; stalled: boolean }> {
+    const chunks = reader.stream(offset, signal);
+    let written = 0,
+      stalled = false;
+    try {
+      for (;;) {
+        const pending = chunks.next();
+        const next = options.stallAt === undefined ? await pending : await settledBy(pending, options.stallAt);
+        if (!next) {
+          // The read may still be waiting on Telegram: leave it behind, its bytes go nowhere.
+          pending.catch(() => {});
+          stalled = true;
+          break;
+        }
+        if (next.done) break;
+        const chunk = next.value;
+        policy.checkDownloadSize(offset + written + chunk.length);
+        let position = offset + written;
+        await writeAll(async (buffer, at, length) => {
+          const result = await handle.write(buffer, at, length, position);
+          position += result.bytesWritten;
+          return result;
+        }, chunk);
+        written += chunk.length;
+        if (options.stop?.(written)) break;
+      }
+    } finally {
+      // A generator with a read in flight can't be closed without waiting for that read.
+      if (!stalled) await chunks.return(undefined);
     }
-    return written;
+    return { written, stalled };
   }
 
   /** Load a message for media access, with coded errors for a missing message or media. */

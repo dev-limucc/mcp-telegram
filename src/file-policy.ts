@@ -38,6 +38,13 @@ export function downloadTimeoutMs(env: NodeJS.ProcessEnv = process.env): number 
  * account's other tool calls, which queue for at most 5 s, get their turn between steps.
  */
 export const DOWNLOAD_STEP_MS = 2000;
+/** A step also stops early when its next chunk would likely keep the account past this. */
+export const DOWNLOAD_STEP_HOLD_MS = 3500;
+/**
+ * A step whose next chunk hasn't arrived after this long returns early as "stalled" (a slow
+ * link or a Telegram flood wait), well inside the 28 s tool deadline.
+ */
+export const DOWNLOAD_STEP_STALL_MS = 8000;
 /** One download step writes at most this much (the supervisor reserves it per step). */
 export const DOWNLOAD_STEP_MAX_BYTES = 64 * MIB;
 

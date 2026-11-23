@@ -120,3 +120,56 @@ test("stepped downloads hold the account for about two seconds per call and cont
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a step that Telegram leaves waiting returns as stalled instead of running into the tool deadline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "telegram-download-stall-"));
+  const bytes = Buffer.alloc(3 * 524288, 7);
+  const document = new Api.Document({
+    id: bigInt(1),
+    accessHash: bigInt(2),
+    fileReference: Buffer.alloc(0),
+    date: 1,
+    mimeType: "video/mp4",
+    size: bigInt(bytes.length),
+    dcId: 1,
+    attributes: [new Api.DocumentAttributeFilename({ fileName: "lecture.mp4" })],
+  });
+  let hang = false;
+  const service = new TelegramService(1, "fixture");
+  Object.assign(service, {
+    connected: true,
+    client: {
+      getMessages: async () => [{ media: new Api.MessageMediaDocument({ document }) }],
+      getSender: async (dcId: number) => ({ dcId }),
+      // A flood wait: GramJS sleeps inside the request and ignores the abort signal.
+      invokeWithSender: async (req: Api.upload.GetFile) => {
+        if (hang) return new Promise(() => {});
+        const offset = Number(req.offset.toString());
+        return new Api.upload.File({
+          type: new Api.storage.FileUnknown(),
+          mtime: 0,
+          bytes: bytes.subarray(offset, offset + req.limit),
+        });
+      },
+    },
+  });
+  try {
+    const path = join(root, "lecture.mp4");
+    hang = true;
+    const empty = await service.downloadMediaStep("@me", 7, path, 0, undefined, 50);
+    assert.deepEqual(empty, {
+      fileName: "lecture.mp4",
+      sizeBytes: 0,
+      totalBytes: bytes.length,
+      done: false,
+      stalled: true,
+    });
+    await assert.rejects(stat(path), { code: "ENOENT" }, "an empty first step leaves no file, so 0 starts again");
+    hang = false;
+    const first = await service.downloadMediaStep("@me", 7, path, 0, undefined, 50);
+    assert.equal(first.done, true, "a fast link finishes 1.5 MiB in one step");
+    assert.deepEqual(await readFile(path), bytes);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

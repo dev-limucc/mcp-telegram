@@ -32,13 +32,25 @@ const TTL = 5 * 60000;
 const WAIT_MS = 40000;
 /** One transfer to a browser or program may run this long (2 GB at about 300 KB/s). */
 const TRANSFER_MAX_MS = 2 * 3600000;
+/** A transfer whose reader takes nothing for this long is dropped, so it frees its slot. */
+const TRANSFER_IDLE_MS = 60000;
 /** A running transfer re-checks the link's grant and policy this often. */
 const RECHECK_MS = 2000;
+/**
+ * Downloads fetching from Telegram at once, in total (one per Telegram account). Each holds its
+ * account's worker, and the supervisor runs only a few, so the rest wait their turn.
+ */
+const MAX_FETCHING = 2;
 /** A download step that fails after progress is retried this many times from the partial file. */
 const STEP_RETRIES = 3;
-/** Supervisor refusals that pass: a busy, restarting or timed-out worker. Others are final. */
-const TRANSIENT =
-  /^(Telegram worker (busy|deadline exceeded|capacity reached|unavailable|is stopping)|Worker unavailable|Telegram executor unavailable|Tool call timed out|Tool queue is full)/;
+/** A first step that failed in the worker or on its way (not refused by it) is retried this often. */
+const FIRST_STEP_RETRIES = 2;
+/** Stalled steps in a row (Telegram sent nothing for a whole step) before the download gives up. */
+const MAX_STALLS = 12;
+/** Refusals that never reached the worker, so no file was touched. */
+const BEFORE_WORKER = /^Telegram worker (busy|capacity reached)/;
+/** Refusals that retrying can't fix. */
+const FINAL = /^(Media storage |Worker supervisor is closing|Telegram worker policy changed)/;
 /** A failure whose message is safe to show to the user (no server paths or internals). */
 class PublicDownloadError extends Error {}
 /** Fixed messages (from the supervisor or this service) that are safe to show as they are. */
@@ -53,7 +65,7 @@ const PUBLIC_MESSAGES = new Set([
   "Invalid download size",
   "Telegram media download made no progress",
 ]);
-type StepResult = { fileName?: unknown; sizeBytes?: unknown; totalBytes?: unknown; done?: unknown };
+type StepResult = { fileName?: unknown; sizeBytes?: unknown; totalBytes?: unknown; done?: unknown; stalled?: unknown };
 const PREFIX = "/media/downloads/";
 const UUID = /^[a-f0-9-]{36}$/;
 export const downloadSchema = z.object({
@@ -113,8 +125,10 @@ interface Options {
   waitMs?: number;
   /** How long one download from Telegram may run (default: MCP_TELEGRAM_DOWNLOAD_TIMEOUT_MS or 60 min). */
   timeoutMs?: number;
-  /** Pause before retrying a failed download step (default 1 s, doubled per retry). */
+  /** Pause before retrying a failed download step (default 1 s, doubled per retry; 5x after a stall). */
   retryDelayMs?: number;
+  /** Downloads fetching from Telegram at once (default 2; always one per Telegram account). */
+  maxFetching?: number;
 }
 type Created = {
   downloadUrl: string;
@@ -142,8 +156,12 @@ export class DirectMediaDownloads {
   private readonly waitMs: number;
   private readonly timeoutMs: number;
   private readonly retryDelayMs: number;
+  private readonly maxFetching: number;
   /** Downloads that outlived their tool call, so close() can wait for them. */
   private background = new Set<Promise<unknown>>();
+  /** Telegram accounts with a download fetching now, and downloads waiting for their turn. */
+  private fetching = new Set<string>();
+  private queue: Array<{ account: string; start: () => void }> = [];
   constructor(private options: Options) {
     if (!isAbsolute(options.root)) throw new Error("Download storage must be absolute");
     this.root = resolve(options.root);
@@ -152,6 +170,7 @@ export class DirectMediaDownloads {
     this.waitMs = options.waitMs ?? WAIT_MS;
     this.timeoutMs = options.timeoutMs ?? downloadTimeoutMs();
     this.retryDelayMs = options.retryDelayMs ?? 1000;
+    this.maxFetching = options.maxFetching ?? MAX_FETCHING;
   }
   initialize(): Promise<void> {
     if (!this.initialized)
@@ -257,12 +276,13 @@ export class DirectMediaDownloads {
     // Still coming from Telegram: hand the link out now and finish in the background.
     t.preparing = true;
     const finishing = work
+      // Nothing in here may reject: a rejection of this detached promise would end the process.
       .catch(async (e) => {
         t.error = this.failure(e);
+        t.expiresAt = this.now() + TTL;
         await t.handle?.close().catch(() => {});
         t.handle = undefined;
-        if (t.dir) await rm(join(t.dir, "data"), { force: true });
-        t.expiresAt = this.now() + TTL;
+        if (t.dir) await rm(join(t.dir, "data"), { force: true }).catch(() => {});
       })
       .finally(() => {
         t.preparing = false;
@@ -301,12 +321,15 @@ export class DirectMediaDownloads {
       await this.marker(t);
     }
     let workerFileName: string | undefined;
+    const release = await this.fetchTurn(selected, signal);
     try {
       workerFileName = await this.fetchSteps(t, args, selected, signal);
     } catch (e) {
       // A legacy path is kept by design, but never a partial file this download created.
       if (t.legacyPath && t.created) await rm(t.path, { force: true });
       throw e;
+    } finally {
+      release();
     }
     signal.throwIfAborted();
     await this.allowed(t);
@@ -343,6 +366,7 @@ export class DirectMediaDownloads {
       new PublicDownloadError(`The file is larger than the ${Math.floor(this.maxBytes / 1048576)} MiB download limit`);
     let offset = 0,
       failures = 0,
+      stalls = 0,
       fileName: string | undefined;
     for (;;) {
       signal.throwIfAborted();
@@ -370,20 +394,24 @@ export class DirectMediaDownloads {
         }
       } catch (e) {
         signal.throwIfAborted();
-        // Retried a few times: a busy, restarting or timed-out worker, and a later step the worker
-        // failed (its partial file is intact). Final: the worker refusing the first step (no
-        // media, no access, the file exists) and any other refusal (policy, scope, arguments).
-        const retry = refused ? offset > 0 : TRANSIENT.test(e instanceof Error ? e.message : "");
-        if (e instanceof PublicDownloadError || !retry || ++failures > STEP_RETRIES) throw e;
-        await sleep(this.retryDelayMs * 2 ** (failures - 1), undefined, { signal }).catch(() =>
-          signal.throwIfAborted(),
-        );
-        // A later step continues from what reached the disk. The first step always restarts at
-        // 0, which only creates a new file: a legacy path's existing file is never continued.
+        const message = e instanceof Error ? e.message : "";
+        let retry: boolean;
+        if (e instanceof PublicDownloadError || FINAL.test(message)) retry = false;
+        // Progress was made, so the media and access were fine and the partial file is intact.
+        else if (offset) retry = true;
+        // The worker refused the first step: no media, no access, or the file already exists.
+        else if (refused) retry = false;
+        // The first step failed in the worker or on the way (busy, restarted, timed out). Our
+        // own storage is started over; a legacy path only when the worker never saw the call.
+        else retry = !!t.dir || BEFORE_WORKER.test(message);
+        if (!retry || ++failures > (offset ? STEP_RETRIES : FIRST_STEP_RETRIES)) throw e;
+        await this.pause(this.retryDelayMs * 2 ** (failures - 1), signal);
+        // A later step continues from what reached the disk (the failed step has settled by the
+        // time the next one runs). A first step always restarts at 0, which only creates a file.
         if (offset) offset = await this.received(t);
+        else if (t.dir) await rm(t.path, { force: true });
         continue;
       }
-      if (!offset) t.created = true;
       const step = result.structuredContent ?? {};
       const { sizeBytes, totalBytes } = step;
       if (
@@ -396,12 +424,72 @@ export class DirectMediaDownloads {
       )
         throw new Error("Invalid download size");
       if (totalBytes > this.maxBytes) throw tooLarge();
-      if (step.done !== true && sizeBytes === offset) throw new Error("Telegram media download made no progress");
+      if (sizeBytes > 0) t.created = true;
       failures = 0;
-      offset = sizeBytes;
       if (typeof step.fileName === "string") fileName = step.fileName;
       if (step.done === true) return fileName;
+      if (step.stalled === true) {
+        // Telegram sent nothing for a whole step (a slow link or a flood wait): wait outside the
+        // worker, then continue. Progress resets the count.
+        stalls = sizeBytes > offset ? 0 : stalls + 1;
+        if (stalls >= MAX_STALLS) throw new PublicDownloadError("Telegram stopped sending the file; try again later");
+        offset = sizeBytes;
+        await this.pause(this.retryDelayMs * 5, signal);
+        continue;
+      }
+      if (sizeBytes === offset) throw new Error("Telegram media download made no progress");
+      stalls = 0;
+      offset = sizeBytes;
     }
+  }
+  /** Wait, or stop at once with the download's own reason when it is cancelled or times out. */
+  private async pause(ms: number, signal: AbortSignal) {
+    await sleep(ms, undefined, { signal }).catch(() => signal.throwIfAborted());
+  }
+  /**
+   * Wait until this download may fetch from Telegram: one per Telegram account, and at most
+   * maxFetching in total, in arrival order. Returns the release for the turn.
+   */
+  private async fetchTurn(account: string, signal: AbortSignal): Promise<() => void> {
+    const free = () => !this.fetching.has(account) && this.fetching.size < this.maxFetching;
+    if (!free() || this.queue.length) {
+      await new Promise<void>((resolve, reject) => {
+        const entry = {
+          account,
+          start: () => {
+            signal.removeEventListener("abort", cancel);
+            resolve();
+          },
+        };
+        const cancel = () => {
+          const index = this.queue.indexOf(entry);
+          if (index >= 0) this.queue.splice(index, 1);
+          reject(signal.reason);
+        };
+        this.queue.push(entry);
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) cancel();
+        else this.startNext();
+      });
+    }
+    this.fetching.add(account);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.fetching.delete(account);
+      this.startNext();
+    };
+  }
+  /** Start the first waiting download whose account is free, if a turn is free. */
+  private startNext() {
+    if (this.fetching.size >= this.maxFetching) return;
+    const index = this.queue.findIndex((entry) => !this.fetching.has(entry.account));
+    if (index < 0) return;
+    const [entry] = this.queue.splice(index, 1);
+    // Claim the account now, so another waiter for it can't start in the same tick.
+    this.fetching.add(entry.account);
+    entry.start();
   }
   /** A failure message that is safe to show: never a server path or an internal error. */
   private failure(e: unknown): string {
@@ -557,7 +645,7 @@ export class DirectMediaDownloads {
           return;
         }
         if (t.active || this.active.size >= 4 || [...this.active.keys()].some((a) => a.owner === t.owner)) {
-          res.sendStatus(429);
+          res.set("Retry-After", "30").sendStatus(429);
           return;
         }
         t.active = true;
@@ -585,6 +673,7 @@ export class DirectMediaDownloads {
       if (!res.writableEnded) controller.abort();
     };
     res.on("close", abort);
+    let idle: NodeJS.Timeout | undefined;
     try {
       await this.allowed(t);
       controller.signal.throwIfAborted();
@@ -593,7 +682,14 @@ export class DirectMediaDownloads {
       const source = t.handle?.createReadStream({ autoClose: false, start, end });
       if (!source) throw new Error("Download unavailable");
       const self = this;
-      let checkedAt = Date.now();
+      let checkedAt = Date.now(),
+        takenAt = Date.now();
+      // A reader that stopped taking bytes (gone without closing, or stalling on purpose) frees
+      // its transfer slot after TRANSFER_IDLE_MS instead of holding it for TRANSFER_MAX_MS.
+      idle = setInterval(() => {
+        if (Date.now() - takenAt > TRANSFER_IDLE_MS) controller.abort();
+      }, 5000);
+      idle.unref();
       async function* checked() {
         for await (const chunk of source as NonNullable<typeof source>) {
           controller.signal.throwIfAborted();
@@ -603,6 +699,7 @@ export class DirectMediaDownloads {
             checkedAt = Date.now();
           }
           yield chunk;
+          takenAt = Date.now();
         }
       }
       res
@@ -616,6 +713,7 @@ export class DirectMediaDownloads {
       else if (!res.destroyed) res.status(403).json({ error: "Download unavailable" });
     } finally {
       clearTimeout(timer);
+      clearInterval(idle);
       res.off("close", abort);
       this.controllers.delete(controller);
     }

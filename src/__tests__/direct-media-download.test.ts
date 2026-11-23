@@ -32,6 +32,14 @@ type SetupOptions = {
   onStep?: (offset: number) => void;
   /** Refuse this many calls as a busy supervisor would, before the worker sees them. */
   busy?: number;
+  /**
+   * Fail a call at this offset the way the supervisor reports a worker that timed out, was
+   * restarted or failed (it has already written `partial` bytes, or created the file at 0).
+   */
+  crash?: Array<{ offset: number; message: string; partial?: number }>;
+  /** Answer this many steps after the first with "stalled" and no new bytes. */
+  stall?: number;
+  maxFetching?: number;
 };
 async function setup(bytes = Buffer.from("original Telegram file"), options: SetupOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), "browser-download-"));
@@ -40,7 +48,8 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
     profile = "full",
     now = 1000,
     flaky = options.flaky ?? 0,
-    busy = options.busy ?? 0;
+    busy = options.busy ?? 0,
+    stall = options.stall ?? 0;
   const calls: Array<{ accountId: string; args: Record<string, unknown> }> = [];
   const identity = {
     kind: "saas",
@@ -62,6 +71,26 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
       if (busy > 0) {
         busy--;
         throw new Error("Telegram worker busy: queue deadline exceeded");
+      }
+      const crash = options.crash?.findIndex((c) => c.offset === offset) ?? -1;
+      if (crash >= 0) {
+        const [{ message, partial = 1 }] = options.crash?.splice(crash, 1) ?? [];
+        if (offset === 0) await writeFile(path, bytes.subarray(0, partial), { flag: "wx", mode: 0o600 });
+        else await appendFile(path, bytes.subarray(offset, offset + partial));
+        throw new Error(message);
+      }
+      if (offset > 0 && stall > 0) {
+        stall--;
+        return {
+          content: [],
+          structuredContent: {
+            fileName: "отчёт.pdf",
+            sizeBytes: offset,
+            totalBytes: bytes.length,
+            done: false,
+            stalled: true,
+          },
+        };
       }
       if (options.refuse) return { content: [{ type: "text", text: options.refuse }], isError: true };
       // Like the real tool, the worker answers its own failures with isError, never by throwing.
@@ -108,6 +137,7 @@ async function setup(bytes = Buffer.from("original Telegram file"), options: Set
     maxBytes: options.maxBytes,
     waitMs: options.waitMs,
     retryDelayMs: 1,
+    maxFetching: options.maxFetching,
   });
   await downloads.initialize();
   const app = express();
@@ -520,6 +550,95 @@ test("a busy worker is waited for, but a first step never continues a file it di
     } finally {
       await taken.close();
     }
+  } finally {
+    await s.close();
+  }
+});
+
+test("failures arrive as the supervisor reports them and are retried only where that is safe", async () => {
+  const bytes = Buffer.from(Array.from({ length: 3000 }, (_, i) => i % 241));
+  // A worker that timed out mid-step ("Worker request cancelled") and one that failed while
+  // creating the file ("Telegram operation failed", leaving a partial file behind).
+  const s = await setup(bytes, {
+    stepBytes: 1000,
+    crash: [
+      { offset: 0, message: "Telegram operation failed", partial: 10 },
+      { offset: 1000, message: "Worker request cancelled", partial: 5 },
+    ],
+  });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.deepEqual(
+      s.calls.map((c) => c.args.offsetBytes),
+      [0, 0, 1000, 1005, 2005],
+    );
+    assert.deepEqual(
+      Buffer.from(await (await fetch(s.url(ticket), { headers: s.headers(ticket) })).arrayBuffer()),
+      bytes,
+    );
+  } finally {
+    await s.close();
+  }
+  const legacy = await setup(bytes, { crash: [{ offset: 0, message: "Worker request cancelled" }] });
+  try {
+    const path = join(legacy.root, owner, "lecture.mp4");
+    await mkdir(join(legacy.root, owner), { recursive: true });
+    await assert.rejects(
+      legacy.downloads.create(owner, "grant", { ...input, downloadPath: path }),
+      /could not be downloaded/,
+    );
+    assert.equal(legacy.calls.length, 1, "a legacy path's first step is retried only when the worker never saw it");
+  } finally {
+    await legacy.close();
+  }
+  const full = await setup(bytes, {
+    stepBytes: 1000,
+    crash: [{ offset: 1000, message: "Media storage quota reached", partial: 0 }],
+  });
+  try {
+    await assert.rejects(full.downloads.create(owner, "grant", input), /^Error: Media storage quota reached$/);
+    assert.equal(full.calls.length, 2, "a full storage quota is reported, not retried");
+    assert.deepEqual(await readdir(join(full.root, owner, ".mcp-downloads")), []);
+  } finally {
+    await full.close();
+  }
+});
+
+test("stalled steps wait and continue instead of failing", async () => {
+  const s = await setup(Buffer.alloc(3000, 9), { stepBytes: 1000, stall: 3 });
+  try {
+    const ticket = await s.downloads.create(owner, "grant", input);
+    assert.equal(ticket.sizeBytes, 3000);
+    assert.deepEqual(
+      s.calls.map((c) => c.args.offsetBytes),
+      [0, 1000, 1000, 1000, 1000, 2000],
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("one download per Telegram account and a few in total fetch at once; the rest wait their turn", async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const s = await setup(Buffer.alloc(4096, 5), { waitMs: 20, hold, maxFetching: 1 });
+  try {
+    const first = await s.downloads.create(owner, "grant", input);
+    const sameAccount = await s.downloads.create(owner, "grant", input);
+    const otherAccount = await s.downloads.create(owner, "grant", { ...input, telegramAccountId: selected });
+    for (const ticket of [first, sameAccount, otherAccount]) assert.equal(ticket.status, "preparing");
+    assert.equal(new Set(s.calls.map((c) => c.args.downloadPath)).size, 1, "only the first one reached a worker");
+    const waiting = await fetch(s.url(sameAccount), { headers: s.headers(sameAccount) });
+    assert.equal(waiting.status, 202);
+    assert.equal((await waiting.json()).receivedBytes, 0);
+    release();
+    for (const ticket of [first, sameAccount, otherAccount])
+      await until(
+        async () => (await fetch(s.url(ticket), { method: "HEAD", headers: s.headers(ticket) })).status === 200,
+      );
+    assert.equal(new Set(s.calls.map((c) => c.args.downloadPath)).size, 3);
   } finally {
     await s.close();
   }

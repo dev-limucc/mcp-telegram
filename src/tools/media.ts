@@ -144,7 +144,7 @@ export function registerMediaTools(server: McpServer, telegram: TelegramService)
           return ok(
             step.done
               ? `Media downloaded to ${downloadPath}`
-              : `Downloaded ${step.sizeBytes} of ${step.totalBytes} bytes to ${downloadPath}; call again with offsetBytes=${step.sizeBytes}`,
+              : `Downloaded ${step.sizeBytes} of ${step.totalBytes} bytes to ${downloadPath}${step.stalled ? " (Telegram is slow to send it; wait a few seconds)" : ""}; call again with offsetBytes=${step.sizeBytes}`,
             step,
           );
         }
